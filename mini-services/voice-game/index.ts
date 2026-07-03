@@ -1,6 +1,6 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
-import { openai, LLM_MODEL, TTS_MODEL, TTS_VOICE, STT_MODEL } from './openai-client'
+import { openai, getZAI, LLM_MODEL, TTS_VOICE } from './openai-client'
 import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
 
 // ====== Types ======
@@ -115,8 +115,7 @@ function extractDelta(data: string): string {
 }
 
 /**
- * 串流呼叫 LLM (OpenAI GPT-4o-mini)。
- * 用 OpenAI SDK 的內建 stream，每個 chunk 觸發 onText。
+ * 串流呼叫 LLM (via OpenAI SDK + z.ai gateway → GLM-4-plus)。
  */
 async function streamLLM(
   messages: Array<{ role: string; content: string }>,
@@ -127,16 +126,10 @@ async function streamLLM(
   const t0 = Date.now()
   console.log(`[LLM] starting stream, model=${LLM_MODEL}, messages=${messages.length}`)
 
-  // 把 system prompt 放第一個（role: 'assistant' 在原 prompt 是 GLM 的怪規則，
-  // OpenAI 標準是 'system'，這裡轉換）
-  const openaiMessages = messages.map(m => ({
-    role: m.role === 'assistant' && m.content.startsWith('你是一個') ? 'system' as const : m.role as any,
-    content: m.content,
-  }))
-
+  // z.ai gateway 接受原本的 messages 格式（role: 'assistant' for system prompt 也 OK）
   const stream = await openai.chat.completions.create({
     model: LLM_MODEL,
-    messages: openaiMessages,
+    messages: messages as any,
     stream: true,
     temperature: 0.9,
   }, { signal: abortSignal })
@@ -158,21 +151,23 @@ async function streamLLM(
 }
 
 /**
- * 把文字轉成 MP3 Buffer (OpenAI TTS)。
+ * 把文字轉成 WAV Buffer (via z.ai TTS)。
  * 失敗時指數 backoff 重試 2 次。
  */
 async function textToSpeechWav(text: string): Promise<Buffer> {
+  const zai = await getZAI()
   const cleanText = text.replace(/\[\[END\]\]/g, '').trim()
   if (!cleanText) return Buffer.alloc(0)
 
   let lastErr: any = null
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const response = await openai.audio.speech.create({
-        model: TTS_MODEL,
-        voice: TTS_VOICE,
+      const response = await zai.audio.tts.create({
         input: cleanText,
-        response_format: 'mp3',
+        voice: TTS_VOICE,
+        speed: 1.0,
+        response_format: 'wav',
+        stream: false,
       })
       const arrayBuffer = await response.arrayBuffer()
       return Buffer.from(new Uint8Array(arrayBuffer))
@@ -180,8 +175,7 @@ async function textToSpeechWav(text: string): Promise<Buffer> {
       lastErr = err
       const msg = String(err?.message || err)
       console.error(`[TTS error attempt ${attempt + 1}]`, msg.slice(0, 200))
-      // 429 / 5xx 才重試
-      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5') || err?.status >= 500) {
+      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5')) {
         const backoff = 1500 * Math.pow(2, attempt)
         console.log(`[TTS retry] attempt=${attempt + 1} backoff=${backoff}ms`)
         await new Promise(r => setTimeout(r, backoff))
@@ -194,29 +188,23 @@ async function textToSpeechWav(text: string): Promise<Buffer> {
 }
 
 /**
- * STT：base64 音訊 -> 文字 (OpenAI Whisper)。
+ * STT：base64 音訊 -> 文字 (via z.ai ASR)。
  * 失敗時指數 backoff 重試 3 次。
  */
-async function speechToText(base64Audio: string, mimeType: string = 'audio/webm'): Promise<string> {
+async function speechToText(base64Audio: string, _mimeType: string = 'audio/webm'): Promise<string> {
+  const zai = await getZAI()
   let lastErr: any = null
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      // 把 base64 轉成 Buffer，再偽裝成 File 物件
-      const buffer = Buffer.from(base64Audio, 'base64')
-      const ext = mimeType.includes('webm') ? 'webm' : mimeType.includes('ogg') ? 'ogg' : 'wav'
-      const file = new File([buffer], `audio.${ext}`, { type: mimeType })
-
-      const response = await openai.audio.transcriptions.create({
-        model: STT_MODEL,
-        file,
-        language: 'zh', // 繁中/簡中/英文都能處理
+      const response = await zai.audio.asr.create({
+        file_base64: base64Audio,
       })
       return response.text || ''
     } catch (err: any) {
       lastErr = err
       const msg = String(err?.message || err)
       console.error(`[ASR error attempt ${attempt + 1}]`, msg.slice(0, 200))
-      if (msg.includes('429') || msg.includes('Too many requests') || err?.status >= 500) {
+      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5')) {
         const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
         console.log(`[ASR retry] attempt=${attempt + 1} backoff=${backoff}ms`)
         await new Promise(r => setTimeout(r, backoff))
@@ -310,7 +298,7 @@ async function streamNarration(
           socket.emit('audio_chunk', {
             seq: currentSeq,
             audio: audioBuffer.toString('base64'),
-            format: 'mp3',
+            format: 'wav',
           })
           console.log(`[TTS] seq=${currentSeq} size=${audioBuffer.length} time=${Date.now() - t0}ms`)
         }

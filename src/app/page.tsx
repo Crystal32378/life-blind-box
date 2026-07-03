@@ -106,7 +106,7 @@ export default function VoiceGamePage() {
         setIsPlaying(true)
 
         // 播放這個 chunk
-        const audioUrl = `data:audio/mp3;base64,${audioB64}`
+        const audioUrl = `data:audio/wav;base64,${audioB64}`
         const audio = audioElRef.current ?? new Audio()
         audioElRef.current = audio
         audio.src = audioUrl
