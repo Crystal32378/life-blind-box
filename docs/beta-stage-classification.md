@@ -92,9 +92,10 @@ BETA_DISABLED=false            # kill switch off
 TTS_PROVIDER=auto
 OPENAI_API_KEY=<your key>
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
-OPENAI_TTS_VOICE=coral              # 英文版用
-# 中文主聲音仍用 Z.ai tongtong（OpenAI 中文偏英文腔）
+OPENAI_TTS_VOICE=coral              # emergency fallback voice; not Chinese primary
+# Future English version candidate: fable
 OPENAI_TTS_RESPONSE_FORMAT=wav
+# 中文主聲音仍用 Z.ai tongtong（OpenAI 中文偏英文腔，不搶中文主聲音）
 ```
 
 ### Voice 選擇策略
