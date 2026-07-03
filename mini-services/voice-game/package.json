@@ -6,6 +6,7 @@
     "dev": "bun --hot index.ts"
   },
   "dependencies": {
+    "openai": "^6.45.0",
     "socket.io": "^4.7.5",
     "z-ai-web-dev-sdk": "^0.0.18"
   },

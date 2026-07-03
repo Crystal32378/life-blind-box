@@ -1,6 +1,6 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
-import ZAI from 'z-ai-web-dev-sdk'
+import { openai, LLM_MODEL, TTS_MODEL, TTS_VOICE, STT_MODEL } from './openai-client'
 import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
 
 // ====== Types ======
@@ -20,15 +20,6 @@ interface PendingTTS {
 const PORT = 3003
 const MAX_TURNS = 5
 const games = new Map<string, GameState>() // socket.id -> game state
-
-// Singleton ZAI instance
-let zaiInstance: any = null
-async function getZAI() {
-  if (!zaiInstance) {
-    zaiInstance = await ZAI.create()
-  }
-  return zaiInstance
-}
 
 // ====== HTTP + Socket.io server ======
 const httpServer = createServer()
@@ -124,30 +115,38 @@ function extractDelta(data: string): string {
 }
 
 /**
- * 串流呼叫 LLM。對每個 chunk 觸發 onText 回呼。回傳完整文字。
+ * 串流呼叫 LLM (OpenAI GPT-4o-mini)。
+ * 用 OpenAI SDK 的內建 stream，每個 chunk 觸發 onText。
  */
 async function streamLLM(
   messages: Array<{ role: string; content: string }>,
   onText: (chunk: string) => void,
   abortSignal?: AbortSignal,
 ): Promise<string> {
-  const zai = await getZAI()
   let fullText = ''
   const t0 = Date.now()
-  console.log(`[LLM] starting stream, messages=${messages.length}`)
+  console.log(`[LLM] starting stream, model=${LLM_MODEL}, messages=${messages.length}`)
 
-  const stream: ReadableStream<Uint8Array> = await zai.chat.completions.create({
-    messages,
-    thinking: { type: 'disabled' },
+  // 把 system prompt 放第一個（role: 'assistant' 在原 prompt 是 GLM 的怪規則，
+  // OpenAI 標準是 'system'，這裡轉換）
+  const openaiMessages = messages.map(m => ({
+    role: m.role === 'assistant' && m.content.startsWith('你是一個') ? 'system' as const : m.role as any,
+    content: m.content,
+  }))
+
+  const stream = await openai.chat.completions.create({
+    model: LLM_MODEL,
+    messages: openaiMessages,
     stream: true,
-  })
+    temperature: 0.9,
+  }, { signal: abortSignal })
   console.log(`[LLM] stream returned after ${Date.now() - t0}ms`)
 
   let chunkCount = 0
-  for await (const data of parseSSEStream(stream, abortSignal)) {
+  for await (const part of stream) {
     if (abortSignal?.aborted) break
     chunkCount++
-    const delta = extractDelta(data)
+    const delta = part?.choices?.[0]?.delta?.content || ''
     if (delta) {
       fullText += delta
       onText(delta)
@@ -159,32 +158,31 @@ async function streamLLM(
 }
 
 /**
- * 把文字轉成 WAV Buffer。失敗時指數 backoff 重試 2 次。
- * 若全部失敗就丟出錯誤，由呼叫端決定是否跳過。
+ * 把文字轉成 MP3 Buffer (OpenAI TTS)。
+ * 失敗時指數 backoff 重試 2 次。
  */
 async function textToSpeechWav(text: string): Promise<Buffer> {
-  const zai = await getZAI()
   const cleanText = text.replace(/\[\[END\]\]/g, '').trim()
   if (!cleanText) return Buffer.alloc(0)
 
   let lastErr: any = null
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const response = await zai.audio.tts.create({
+      const response = await openai.audio.speech.create({
+        model: TTS_MODEL,
+        voice: TTS_VOICE,
         input: cleanText,
-        voice: 'tongtong',
-        speed: 1.0,
-        response_format: 'wav',
-        stream: false,
+        response_format: 'mp3',
       })
       const arrayBuffer = await response.arrayBuffer()
       return Buffer.from(new Uint8Array(arrayBuffer))
     } catch (err: any) {
       lastErr = err
       const msg = String(err?.message || err)
+      console.error(`[TTS error attempt ${attempt + 1}]`, msg.slice(0, 200))
       // 429 / 5xx 才重試
-      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5')) {
-        const backoff = 1500 * Math.pow(2, attempt) // 1.5s, 3s, 6s
+      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5') || err?.status >= 500) {
+        const backoff = 1500 * Math.pow(2, attempt)
         console.log(`[TTS retry] attempt=${attempt + 1} backoff=${backoff}ms`)
         await new Promise(r => setTimeout(r, backoff))
         continue
@@ -196,21 +194,29 @@ async function textToSpeechWav(text: string): Promise<Buffer> {
 }
 
 /**
- * STT：base64 音訊 -> 文字。失敗時指數 backoff 重試 3 次。
+ * STT：base64 音訊 -> 文字 (OpenAI Whisper)。
+ * 失敗時指數 backoff 重試 3 次。
  */
-async function speechToText(base64Audio: string): Promise<string> {
-  const zai = await getZAI()
+async function speechToText(base64Audio: string, mimeType: string = 'audio/webm'): Promise<string> {
   let lastErr: any = null
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const response = await zai.audio.asr.create({
-        file_base64: base64Audio,
+      // 把 base64 轉成 Buffer，再偽裝成 File 物件
+      const buffer = Buffer.from(base64Audio, 'base64')
+      const ext = mimeType.includes('webm') ? 'webm' : mimeType.includes('ogg') ? 'ogg' : 'wav'
+      const file = new File([buffer], `audio.${ext}`, { type: mimeType })
+
+      const response = await openai.audio.transcriptions.create({
+        model: STT_MODEL,
+        file,
+        language: 'zh', // 繁中/簡中/英文都能處理
       })
       return response.text || ''
     } catch (err: any) {
       lastErr = err
       const msg = String(err?.message || err)
-      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5')) {
+      console.error(`[ASR error attempt ${attempt + 1}]`, msg.slice(0, 200))
+      if (msg.includes('429') || msg.includes('Too many requests') || err?.status >= 500) {
         const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
         console.log(`[ASR retry] attempt=${attempt + 1} backoff=${backoff}ms`)
         await new Promise(r => setTimeout(r, backoff))
@@ -241,9 +247,9 @@ class Semaphore {
   }
 }
 
-const ttsSemaphore = new Semaphore(1)
+const ttsSemaphore = new Semaphore(2)
 let lastTtsStartTime = 0
-const MIN_TTS_INTERVAL_MS = 1200 // 兩次 TTS 啟動之間至少間隔 1200ms，避免 429
+const MIN_TTS_INTERVAL_MS = 300 // OpenAI 限流寬鬆，間隔 300ms 即可
 
 /**
  * 處理一輪 LLM 串流 + TTS 並行推送。
@@ -298,15 +304,15 @@ async function streamNarration(
 
         if (abortSignal?.aborted) return
         const t0 = Date.now()
-        const wavBuffer = await textToSpeechWav(cleanSentence)
+        const audioBuffer = await textToSpeechWav(cleanSentence)
         if (abortSignal?.aborted) return
-        if (wavBuffer.length > 0) {
+        if (audioBuffer.length > 0) {
           socket.emit('audio_chunk', {
             seq: currentSeq,
-            audio: wavBuffer.toString('base64'),
-            format: 'wav',
+            audio: audioBuffer.toString('base64'),
+            format: 'mp3',
           })
-          console.log(`[TTS] seq=${currentSeq} size=${wavBuffer.length} time=${Date.now() - t0}ms`)
+          console.log(`[TTS] seq=${currentSeq} size=${audioBuffer.length} time=${Date.now() - t0}ms`)
         }
       } catch (err) {
         console.error('[TTS error]', err)
@@ -431,7 +437,8 @@ io.on('connection', (socket) => {
       // 1. STT
       const t0 = Date.now()
       socket.emit('status', { stage: 'transcribing' })
-      const userText = await speechToText(payload.audio)
+      const mimeType = payload.format || 'audio/webm'
+      const userText = await speechToText(payload.audio, mimeType)
       console.log(`[STT] ${socket.id} time=${Date.now() - t0}ms text="${userText}"`)
 
       if (!userText || !userText.trim()) {
