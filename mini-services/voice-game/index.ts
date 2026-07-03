@@ -260,11 +260,12 @@ async function streamNarration(
   onFullText?: (text: string, isEnding: boolean, meta?: EndingMeta) => void,
   abortSignal?: AbortSignal,
   onLLMDone?: () => void,
-  ids?: { sessionId: string; turnId: number; generationId: string },
+  ids?: { sessionId: string; turnId: number; generationId: string; anonUserId?: string },
 ): Promise<{ fullText: string; isEnding: boolean; meta?: EndingMeta }> {
   const sessionId = ids?.sessionId || ''
   const turnId = ids?.turnId ?? 0
   const generationId = ids?.generationId || ''
+  const anonUserId = ids?.anonUserId || ''
 
   let buffer = ''
   let fullText = ''
@@ -301,7 +302,7 @@ async function streamNarration(
       console.warn(`[safety] LLM output blocked: ${safetyCheck.reason}, using fallback`)
       logUsage({
         session_id: sessionId,
-        anon_user_id: '',  // 由 caller 補
+        anon_user_id: anonUserId,
         turn_id: turnId,
         generation_id: generationId,
         event_type: 'safety_block',
@@ -358,7 +359,7 @@ async function streamNarration(
         })
         logUsage({
           session_id: sessionId,
-          anon_user_id: '',
+          anon_user_id: anonUserId,
           turn_id: turnId,
           generation_id: generationId,
           event_type: 'tts_error',
@@ -404,7 +405,7 @@ async function streamNarration(
   // 記錄 latency
   logUsage({
     session_id: sessionId,
-    anon_user_id: '',
+    anon_user_id: anonUserId,
     turn_id: turnId,
     generation_id: generationId,
     event_type: 'turn_llm_done',
@@ -550,7 +551,7 @@ io.on('connection', (socket) => {
         },
         undefined,  // abortSignal
         undefined,  // onLLMDone
-        { sessionId: socket.id, turnId, generationId },
+        { sessionId: socket.id, turnId, generationId, anonUserId: game.anonUserId },
       )
 
       // 開場白永遠回傳 isEnding=false（帶 ID）
@@ -743,7 +744,7 @@ io.on('connection', (socket) => {
         },
         undefined,
         undefined,
-        { sessionId: socket.id, turnId: nextTurn, generationId },
+        { sessionId: socket.id, turnId: nextTurn, generationId, anonUserId: game.anonUserId },
       )
 
       const finalEnding = allowEnding ? (isEnding || detectedEnding) : false

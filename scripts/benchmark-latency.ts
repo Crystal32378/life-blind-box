@@ -1,16 +1,27 @@
 #!/usr/bin/env bun
-// P0-5: latency benchmark
-// 跑 N 局（只測開場，不測互動），輸出 p50 / p95 各項 latency
+// P0-5: latency benchmark (opening narration only)
+//
+// ⚠️ 重要：這個 benchmark 目前「只測 start_game 開場 latency」，
+//    不含 submit_audio 互動輪（ASR → LLM → TTS 全互動流程）。
+//    互動輪的 latency 需要真實錄音 + ASR，無法用純 socket 模擬，
+//    未來會另寫一個 interactive benchmark 補上。
 //
 // 用法：
 //   bun run scripts/benchmark-latency.ts [局數]
 //   預設跑 20 局
 //
-// 量測指標：
-//   - start_game → first text_chunk
-//   - start_game → first audio_chunk
-//   - start_game → turn_complete
-//   - ending meta parse success rate（只測開場，這項不適用，但保留欄位）
+// 量測指標（全部基於 start_game 觸發）：
+//   - start_game → first text_chunk（LLM 第一個 delta 到達）
+//   - start_game → first audio_chunk（第一個 TTS chunk 到達）
+//   - start_game → turn_complete（LLM 串流結束）
+//
+// 不量測：
+//   - submit_audio → ASR done
+//   - ASR done → first text_chunk
+//   - ASR done → first audio_chunk
+//   - interruption response
+//   - ending meta parse success rate
+//   （以上需要真實錄音 + 互動，不在這個 benchmark 範圍）
 
 import { io } from 'socket.io-client'
 
@@ -109,7 +120,9 @@ function stats(values: Array<number | null>): { p50: number; p95: number; count:
 }
 
 async function main() {
-  console.log(`\n=== Latency Benchmark: ${NUM_GAMES} games ===\n`)
+  console.log(`\n=== Latency Benchmark (opening narration only): ${NUM_GAMES} games ===`)
+  console.log(`⚠️  Only measures start_game → first chunk latency.`)
+  console.log(`⚠️  Does NOT measure submit_audio / ASR / interactive turns.\n`)
 
   const results: GameLatency[] = []
   for (let i = 0; i < NUM_GAMES; i++) {
@@ -153,6 +166,8 @@ async function main() {
 
   // 輸出 JSON summary 給大G 看
   const summary = {
+    scope: 'opening_narration_only',
+    scope_note: 'Only measures start_game → first chunk latency. Does NOT include submit_audio / ASR / interactive turns.',
     timestamp: new Date().toISOString(),
     numGames: NUM_GAMES,
     firstText: firstTextStats,

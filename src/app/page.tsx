@@ -342,6 +342,11 @@ export default function VoiceGamePage() {
       ending?: string
       meta?: EndingMeta
     }) => {
+      // P0-fix1: discard stale generation's game_over（避免舊局晚到的 game_over 結束新局）
+      if (data.generationId && data.generationId !== currentGenerationIdRef.current) {
+        console.debug(`[discard game_over] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
+        return
+      }
       if (data?.meta) {
         setEndingMeta(data.meta)
       }
@@ -355,7 +360,13 @@ export default function VoiceGamePage() {
       }
     })
 
-    socket.on('error_msg', (data: { message: string; code?: string }) => {
+    socket.on('error_msg', (data: { message: string; code?: string; generationId?: string }) => {
+      // P0-fix2: 有 generationId 且不是 current 的 error 直接 discard
+      // 沒有 generationId 的 global error（如 quota_blocked、connect 失敗）才照收
+      if (data.generationId && data.generationId !== currentGenerationIdRef.current) {
+        console.debug(`[discard error_msg] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
+        return
+      }
       setError(data.message)
       setPhaseSafe('idle')
     })
