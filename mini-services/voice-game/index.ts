@@ -2,7 +2,7 @@ import { createServer } from 'http'
 import { Server } from 'socket.io'
 import { openai, getZAI, LLM_MODEL, TTS_VOICE } from './openai-client'
 import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
-import { pickRandomTemplate, templateToOpeningPrompt, SceneTemplate, CATEGORY_NAMES, SceneCategory } from './scene-templates'
+import { pickRandomTemplate, pickTemplateByCategory, templateToOpeningPrompt, SceneTemplate, CATEGORY_NAMES, SceneCategory, SCENE_TEMPLATES } from './scene-templates'
 
 // ====== Types ======
 interface GameState {
@@ -363,8 +363,8 @@ io.on('connection', (socket) => {
 
   socket.emit('connected', { sessionId: socket.id })
 
-  // 開始遊戲：生成開場白
-  socket.on('start_game', async () => {
+  // 開始遊戲：生成開場白（可選 category，不傳就完全隨機）
+  socket.on('start_game', async (payload?: { category?: string }) => {
     const game = games.get(socket.id)
     if (!game) return
     if (game.ended) {
@@ -372,10 +372,11 @@ io.on('connection', (socket) => {
       return
     }
 
-    // 抽一個 scene template
-    const template = pickRandomTemplate()
+    // 抽一個 scene template（有指定 category 就從該類別抽，否則完全隨機）
+    const category = payload?.category as SceneCategory | undefined
+    const template = category ? pickTemplateByCategory(category) : pickRandomTemplate()
     game.template = template
-    console.log(`[start_game] ${socket.id} template=${template.id} (${template.category})`)
+    console.log(`[start_game] ${socket.id} template=${template.id} (category=${template.category}, requested=${category || 'random'})`)
 
     socket.emit('turn_start', { turn: 0 })
 
@@ -417,6 +418,17 @@ io.on('connection', (socket) => {
       console.error('[start_game error]', err)
       socket.emit('error_msg', { message: '開場生成失敗，請重試' })
     }
+  })
+
+  // 列出所有可用類別（給前端顯示用）
+  socket.on('list_categories', () => {
+    const categories = Object.entries(CATEGORY_NAMES).map(([key, val]) => ({
+      key: key as SceneCategory,
+      zh: val.zh,
+      en: val.en,
+      count: SCENE_TEMPLATES.filter(t => t.category === key).length,
+    }))
+    socket.emit('categories_list', { categories })
   })
 
   // 提交錄音：base64 音訊

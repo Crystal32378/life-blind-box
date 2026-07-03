@@ -26,6 +26,25 @@ interface SceneTemplateInfo {
   categoryEn: string
 }
 
+interface CategoryInfo {
+  key: string
+  zh: string
+  en: string
+  count: number
+}
+
+// 類別 emoji 對照
+const CATEGORY_EMOJI: Record<string, string> = {
+  absurd_survival: '\u{1F300}',
+  identity_reversal: '\u{1F3AD}',
+  revenge_drama: '\u{2694}\u{FE0F}',
+  high_stakes_romance: '\u{1F494}',
+  workplace_betrayal: '\u{1F4BC}',
+  family_secret: '\u{1F3DF}\u{FE0F}',
+  fantasy_rebellion: '\u{1F52E}',
+  social_humiliation: '\u{1F3AA}',
+}
+
 // ============ Constants ============
 const AUDIO_PLAYBACK_RATE = 1.0
 const DAILY_FREE_LIMIT = 3
@@ -72,6 +91,7 @@ export default function VoiceGamePage() {
   const [dailyCount, setDailyCount] = useState(0)
   const [copied, setCopied] = useState(false)
   const [sceneTemplate, setSceneTemplate] = useState<SceneTemplateInfo | null>(null)
+  const [categories, setCategories] = useState<CategoryInfo[]>([])
 
   // === Refs ===
   const socketRef = useRef<Socket | null>(null)
@@ -195,8 +215,15 @@ export default function VoiceGamePage() {
     })
     socketRef.current = socket
 
-    socket.on('connect', () => setConnected(true))
+    socket.on('connect', () => {
+      setConnected(true)
+      socket.emit('list_categories')
+    })
     socket.on('disconnect', () => setConnected(false))
+
+    socket.on('categories_list', (data: { categories: CategoryInfo[] }) => {
+      setCategories(data.categories)
+    })
 
     socket.on('text_chunk', (data: { seq: number; text: string }) => {
       setSubtitles(prev => [...prev, { seq: data.seq, text: data.text, role: 'narrator' }])
@@ -360,7 +387,7 @@ export default function VoiceGamePage() {
   }, [setPhaseSafe])
 
   // ============ Game Actions ============
-  const startGame = useCallback(() => {
+  const startGame = useCallback((category?: string) => {
     // 檢查 daily limit
     const { count } = getDailyCount()
     if (count >= DAILY_FREE_LIMIT) {
@@ -379,7 +406,7 @@ export default function VoiceGamePage() {
     // 開局時 increment
     const newCount = incrementDailyCount()
     setDailyCount(newCount)
-    socketRef.current?.emit('start_game')
+    socketRef.current?.emit('start_game', category ? { category } : {})
   }, [interruptPlayback, setPhaseSafe])
 
   const resetGame = useCallback(() => {
@@ -525,13 +552,38 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
                 <p className="text-xs text-zinc-600">明天再來，或之後解鎖更多劇情包</p>
               </div>
             ) : (
-              <button
-                onClick={startGame}
-                disabled={!connected}
-                className="mt-4 px-8 py-3 rounded-full bg-white text-black font-medium tracking-wider hover:bg-zinc-200 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-              >
-                開啟盲盒
-              </button>
+              <>
+                <button
+                  onClick={() => startGame()}
+                  disabled={!connected}
+                  className="mt-4 px-8 py-3 rounded-full bg-white text-black font-medium tracking-wider hover:bg-zinc-200 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  開啟盲盒
+                </button>
+
+                {/* 類別選擇 */}
+                {categories.length > 0 && (
+                  <div className="mt-8">
+                    <p className="text-xs text-zinc-600 tracking-widest mb-3">
+                      或選擇類別
+                    </p>
+                    <div className="flex flex-wrap justify-center gap-2 max-w-md mx-auto">
+                      {categories.map((cat) => (
+                        <button
+                          key={cat.key}
+                          onClick={() => startGame(cat.key)}
+                          disabled={!connected}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs hover:bg-zinc-800 hover:border-zinc-700 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          <span>{CATEGORY_EMOJI[cat.key] || '\u{1F3AF}'}</span>
+                          <span>{cat.zh}</span>
+                          <span className="text-zinc-600">{cat.count}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
             {remainingToday > 0 && remainingToday < DAILY_FREE_LIMIT && (
               <p className="text-xs text-zinc-600 tracking-widest">
