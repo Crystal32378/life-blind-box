@@ -23,6 +23,27 @@ Known gaps:
 - Safety is a first-layer regex screen, not full moderation
 - Voice-game service is single process
 
+## Echo Stability Gate
+
+The next milestone is not more features. The next milestone is proving that after the player speaks, the AI voice still feels alive.
+
+This is an echo-stability validation period, not a completed voice beta. The engineering safety belts are sufficient for controlled observation, but the voice experience is still constrained by TTS 429 risk. Do not present the voice beta as complete until interactive latency and TTS fallback behavior are verified.
+
+Immediate priorities:
+
+1. Complete the interactive latency benchmark from user speech through ASR, first text, first audio, and turn complete.
+2. Add a TTS fallback path so that when TTS hits 429 or repeated failure, the experience clearly enters subtitle mode instead of feeling broken.
+
+First tester group:
+
+- 5-10 trained testers only
+- No public launch
+- No large group testing
+- No social distribution
+- No paid acquisition
+
+The project may be shown to people at close range, but only with caretaker supervision. The creature's voice is not stable enough yet for wider release.
+
 ## 1. Care Manual
 
 ### Who May Test
@@ -166,6 +187,14 @@ Current protections:
 - Minimum interval between TTS starts
 - Exponential retry
 - Text still displays if audio fails
+
+Required fallback before broader beta:
+
+- Detect 429 or repeated TTS failure at turn level
+- Emit an explicit subtitle-mode state to the client
+- Keep text streaming visible and reassuring
+- Avoid silent failure that makes the app feel broken
+- Log fallback entry and recovery attempts
 
 Next hardening candidates:
 
