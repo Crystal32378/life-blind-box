@@ -92,6 +92,9 @@ export default function VoiceGamePage() {
   const [copied, setCopied] = useState(false)
   const [sceneTemplate, setSceneTemplate] = useState<SceneTemplateInfo | null>(null)
   const [categories, setCategories] = useState<CategoryInfo[]>([])
+  // P1: text-only fallback mode（TTS circuit breaker 觸發）
+  const [ttsMode, setTtsMode] = useState<'voice' | 'text_only'>('voice')
+  const [ttsModeReason, setTtsModeReason] = useState<string>('')
 
   // ====== P0-1: generation tracking ======
   // currentGenerationId：前端只接受符合這個 ID 的 text/audio chunk，舊的全部 discard
@@ -319,6 +322,28 @@ export default function VoiceGamePage() {
       setSceneTemplate(data)
     })
 
+    // P1: 接收 TTS circuit breaker 狀態
+    socket.on('tts_status', (data: {
+      sessionId?: string
+      turnId?: number
+      generationId?: string
+      mode: 'voice' | 'text_only'
+      reason?: string
+      retryAfterMs?: number
+    }) => {
+      if (data.generationId && data.generationId !== currentGenerationIdRef.current) return
+      console.warn(`[tts_status] mode=${data.mode} reason=${data.reason}`)
+      setTtsMode(data.mode)
+      setTtsModeReason(data.reason || '')
+      // 5 分鐘後自動恢復（如果 server 沒有再送 close 事件）
+      if (data.mode === 'text_only' && data.retryAfterMs) {
+        setTimeout(() => {
+          setTtsMode('voice')
+          setTtsModeReason('')
+        }, Math.min(data.retryAfterMs, 5 * 60 * 1000))
+      }
+    })
+
     // P0-1: turn_complete 帶 generationId，舊的 discard
     socket.on('turn_complete', (data: {
       sessionId?: string
@@ -377,6 +402,8 @@ export default function VoiceGamePage() {
       setNarrationText('')
       setEndingMeta(null)
       setSceneTemplate(null)
+      setTtsMode('voice')
+      setTtsModeReason('')
       currentGenerationIdRef.current = ''
       currentTurnIdRef.current = 0
       setPhaseSafe('idle')
@@ -505,6 +532,8 @@ export default function VoiceGamePage() {
     setNarrationText('')
     setEndingMeta(null)
     setSceneTemplate(null)
+    setTtsMode('voice')
+    setTtsModeReason('')
     setTurn(0)
     interruptPlayback()
     nextPlaySeqRef.current = 0
@@ -519,6 +548,8 @@ export default function VoiceGamePage() {
     interruptPlayback()
     nextPlaySeqRef.current = 0
     setSceneTemplate(null)
+    setTtsMode('voice')
+    setTtsModeReason('')
     socketRef.current?.emit('reset_game')
   }, [interruptPlayback])
 
@@ -713,9 +744,23 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
         {/* Narration / Subtitles display */}
         {(phase !== 'idle' || subtitles.length > 0) && phase !== 'ended' && (
           <div className="w-full space-y-6">
+            {/* P1: text-only fallback 提示（不是 error，是「AI 嗆聲中」） */}
+            {ttsMode === 'text_only' && (
+              <div className="text-center">
+                <span className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-amber-950/40 border border-amber-800/50 text-amber-300 text-xs tracking-widest">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  AI 嗆聲中，先用字幕模式演出
+                </span>
+              </div>
+            )}
+
             {/* 即時旁白字幕 */}
             <div className="min-h-[120px] flex items-center justify-center">
-              <p className="text-2xl md:text-3xl font-serif text-center leading-relaxed text-zinc-100 max-w-2xl">
+              <p className={`text-center leading-relaxed max-w-2xl ${
+                ttsMode === 'text_only'
+                  ? 'text-2xl md:text-3xl font-serif text-amber-100'  // 字幕模式：放大加亮
+                  : 'text-2xl md:text-3xl font-serif text-zinc-100'
+              }`}>
                 {narrationText || (
                   <span className="text-zinc-600 text-base">
                     {phase === 'transcribing' ? '正在理解你的話...' :

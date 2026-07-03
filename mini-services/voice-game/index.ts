@@ -7,6 +7,8 @@ import { pickRandomTemplate, pickTemplateByCategory, templateToOpeningPrompt, Sc
 import { usageLogger, logUsage, UsageLogger } from './usage-logger'
 import { QuotaChecker } from './quota'
 import { checkContentSafety, checkLLMOutput, checkUserInput, SAFETY_FALLBACK_NARRATION } from './safety'
+import { TTSCircuitBreaker } from './tts-circuit-breaker'
+import { textToSpeechOpenAI, isOpenAIConfigured } from './openai-tts'
 
 // ====== Types ======
 interface GameState {
@@ -30,7 +32,25 @@ const MAX_TURNS = 5
 const games = new Map<string, GameState>() // socket.id -> game state
 
 // ====== HTTP + Socket.io server ======
-const httpServer = createServer()
+const httpServer = createServer((req, res) => {
+  // P1: monitor endpoint for circuit breaker status
+  if (req.url === '/health') {
+    const breakerStatus = TTSCircuitBreaker.getStatus()
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({
+      ok: true,
+      tts_provider: TTS_PROVIDER,
+      openai_configured: isOpenAIConfigured(),
+      circuit_breaker: breakerStatus,
+      uptime_ms: Date.now() - startTime,
+    }))
+    return
+  }
+  res.writeHead(404)
+  res.end('Not Found')
+})
+const startTime = Date.now()
+
 const io = new Server(httpServer, {
   path: '/',
   cors: { origin: '*', methods: ['GET', 'POST'] },
@@ -158,41 +178,134 @@ async function streamLLM(
   return fullText
 }
 
+// ====== TTS provider config ======
+const TTS_PROVIDER = process.env.TTS_PROVIDER || 'auto'  // 'zai' | 'openai' | 'auto'
+
 /**
- * 把文字轉成 WAV Buffer (via z.ai TTS)。
- * 失敗時指數 backoff 重試 2 次。
+ * Z.ai TTS（原本的 provider）
  */
-async function textToSpeechWav(text: string): Promise<Buffer> {
+async function textToSpeechZai(text: string): Promise<Buffer> {
   const zai = await getZAI()
   const cleanText = text.replace(/\[\[END\]\]/g, '').trim()
   if (!cleanText) return Buffer.alloc(0)
 
-  let lastErr: any = null
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const response = await zai.audio.tts.create({
+    input: cleanText,
+    voice: TTS_VOICE,
+    speed: 1.0,
+    response_format: 'wav',
+    stream: false,
+  })
+  const arrayBuffer = await response.arrayBuffer()
+  return Buffer.from(new Uint8Array(arrayBuffer))
+}
+
+interface TTSResult {
+  buffer: Buffer
+  provider: 'zai' | 'openai'
+  fallbackUsed: boolean
+  errorProvider?: 'zai' | 'openai'
+  statusCode?: number
+}
+
+/**
+ * 統一的 TTS 入口，根據 TTS_PROVIDER 決定用哪個 provider
+ * - 'zai': 只用 Z.ai
+ * - 'openai': 只用 OpenAI
+ * - 'auto': 先 Z.ai，429 失敗 → fallback OpenAI，OpenAI 也失敗 → throw
+ */
+async function textToSpeechWav(text: string, sessionId: string): Promise<TTSResult> {
+  const cleanText = text.replace(/\[\[END\]\]/g, '').trim()
+  if (!cleanText) return { buffer: Buffer.alloc(0), provider: 'zai', fallbackUsed: false }
+
+  // ====== P1: circuit breaker 檢查 ======
+  const breakerStatus = TTSCircuitBreaker.check(sessionId)
+  if (breakerStatus.mode === 'text_only') {
+    // circuit open，不呼叫 TTS，直接回空 buffer（讓前端走字幕 fallback）
+    console.warn(`[circuit-breaker] TTS skipped for ${sessionId.slice(0,8)}: ${breakerStatus.reason}`)
+    return {
+      buffer: Buffer.alloc(0),
+      provider: 'zai',
+      fallbackUsed: false,
+      errorProvider: 'zai',
+      statusCode: 429,
+    }
+  }
+
+  const cleanText2 = cleanText  // 已經 trim 過
+
+  // ====== TTS_PROVIDER=zai：只用 Z.ai ======
+  if (TTS_PROVIDER === 'zai') {
     try {
-      const response = await zai.audio.tts.create({
-        input: cleanText,
-        voice: TTS_VOICE,
-        speed: 1.0,
-        response_format: 'wav',
-        stream: false,
-      })
-      const arrayBuffer = await response.arrayBuffer()
-      return Buffer.from(new Uint8Array(arrayBuffer))
+      const buffer = await textToSpeechZai(cleanText2)
+      TTSCircuitBreaker.recordSuccess(sessionId)
+      return { buffer, provider: 'zai', fallbackUsed: false }
     } catch (err: any) {
-      lastErr = err
       const msg = String(err?.message || err)
-      console.error(`[TTS error attempt ${attempt + 1}]`, msg.slice(0, 200))
-      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5')) {
-        const backoff = 1500 * Math.pow(2, attempt)
-        console.log(`[TTS retry] attempt=${attempt + 1} backoff=${backoff}ms`)
-        await new Promise(r => setTimeout(r, backoff))
-        continue
+      const is429 = msg.includes('429') || msg.includes('Too many requests')
+      if (is429) {
+        TTSCircuitBreaker.record429(sessionId)
       }
       throw err
     }
   }
-  throw lastErr
+
+  // ====== TTS_PROVIDER=openai：只用 OpenAI ======
+  if (TTS_PROVIDER === 'openai') {
+    if (!isOpenAIConfigured()) {
+      throw new Error('TTS_PROVIDER=openai but OPENAI_API_KEY not set')
+    }
+    const result = await textToSpeechOpenAI(cleanText2)
+    TTSCircuitBreaker.recordSuccess(sessionId)
+    return {
+      buffer: result.buffer,
+      provider: 'openai',
+      fallbackUsed: false,
+    }
+  }
+
+  // ====== TTS_PROVIDER=auto：先 Z.ai，429 → fallback OpenAI ======
+  if (TTS_PROVIDER === 'auto') {
+    // 先試 Z.ai
+    try {
+      const buffer = await textToSpeechZai(cleanText2)
+      TTSCircuitBreaker.recordSuccess(sessionId)
+      return { buffer, provider: 'zai', fallbackUsed: false }
+    } catch (err: any) {
+      const msg = String(err?.message || err)
+      const is429 = msg.includes('429') || msg.includes('Too many requests')
+      console.warn(`[TTS] Z.ai failed (${is429 ? '429' : 'other'}): ${msg.slice(0, 100)}`)
+
+      if (is429) {
+        TTSCircuitBreaker.record429(sessionId)
+      }
+
+      // Z.ai 429 → 試 OpenAI fallback
+      if (is429 && isOpenAIConfigured()) {
+        console.log('[TTS] falling back to OpenAI TTS')
+        try {
+          const result = await textToSpeechOpenAI(cleanText2)
+          TTSCircuitBreaker.recordSuccess(sessionId)
+          return {
+            buffer: result.buffer,
+            provider: 'openai',
+            fallbackUsed: true,
+            errorProvider: 'zai',
+            statusCode: 429,
+          }
+        } catch (openaiErr: any) {
+          console.error('[TTS] OpenAI fallback also failed:', String(openaiErr?.message || openaiErr).slice(0, 100))
+          // 兩個都掛，throw 給上層走 text-only fallback
+          throw openaiErr
+        }
+      }
+
+      // 非 429 錯誤，直接 throw
+      throw err
+    }
+  }
+
+  throw new Error(`Unknown TTS_PROVIDER: ${TTS_PROVIDER}`)
 }
 
 /**
@@ -243,9 +356,10 @@ class Semaphore {
   }
 }
 
-const ttsSemaphore = new Semaphore(2)
+// P1-4: 降低 TTS 壓力（beta fragile window）
+const ttsSemaphore = new Semaphore(1)  // 並行數從 2 降成 1
 let lastTtsStartTime = 0
-const MIN_TTS_INTERVAL_MS = 300 // OpenAI 限流寬鬆，間隔 300ms 即可
+const MIN_TTS_INTERVAL_MS = 1500  // 從 300ms 提高到 1500ms
 
 /**
  * 處理一輪 LLM 串流 + TTS 並行推送。
@@ -336,19 +450,43 @@ async function streamNarration(
 
         if (abortSignal?.aborted) return
         const t0 = Date.now()
-        const audioBuffer = await textToSpeechWav(finalSentence)
+        const ttsResult = await textToSpeechWav(finalSentence, sessionId)
         if (abortSignal?.aborted) return
-        if (audioBuffer.length > 0) {
+
+        // P1: 如果 circuit breaker 開了，emit tts_status 讓前端切字幕模式
+        if (ttsResult.buffer.length === 0 && ttsResult.statusCode === 429) {
+          const breakerStatus = TTSCircuitBreaker.check(sessionId)
+          if (breakerStatus.mode === 'text_only') {
+            socket.emit('tts_status', {
+              sessionId, turnId, generationId,
+              mode: 'text_only',
+              reason: breakerStatus.reason || 'TTS_RATE_LIMIT',
+              retryAfterMs: breakerStatus.retryAfterMs,
+            })
+            logUsage({
+              session_id: sessionId,
+              anon_user_id: anonUserId,
+              turn_id: turnId,
+              generation_id: generationId,
+              event_type: 'tts_circuit_open',
+              timestamp: new Date().toISOString(),
+              extra: { reason: breakerStatus.reason, seq: currentSeq },
+            })
+          }
+          return  // 不 emit audio_chunk，前端用字幕
+        }
+
+        if (ttsResult.buffer.length > 0) {
           socket.emit('audio_chunk', {
             sessionId,
             turnId,
             generationId,
             seq: currentSeq,
-            audio: audioBuffer.toString('base64'),
+            audio: ttsResult.buffer.toString('base64'),
             format: 'wav',
           })
           if (!ttsFirstAudioMs) ttsFirstAudioMs = Date.now() - turnStart
-          console.log(`[TTS] gen=${generationId.slice(0,8)} seq=${currentSeq} size=${audioBuffer.length} time=${Date.now() - t0}ms`)
+          console.log(`[TTS] gen=${generationId.slice(0,8)} seq=${currentSeq} provider=${ttsResult.provider}${ttsResult.fallbackUsed ? '(fallback)' : ''} size=${ttsResult.buffer.length} time=${Date.now() - t0}ms`)
         }
       } catch (err: any) {
         retryCount++
@@ -366,7 +504,7 @@ async function streamNarration(
           timestamp: new Date().toISOString(),
           retry_count: retryCount,
           error_code: String(err?.status || err?.code || 'TTS_FAIL'),
-          extra: { seq: currentSeq },
+          extra: { seq: currentSeq, tts_provider: TTS_PROVIDER },
         })
       } finally {
         ttsSemaphore.release()
