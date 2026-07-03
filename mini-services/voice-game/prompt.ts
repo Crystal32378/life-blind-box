@@ -21,6 +21,26 @@ export const SYSTEM_PROMPT = `你是一個「人生盲盒」的旁白與互動�
 - 用逗號和句號分段，方便 TTS 分句播放。
 - 不要使用 markdown 格式。
 - 絕對不要在文字中出現任何阿拉伯數字（0-9）。
+
+【結局格式】
+當你要結束故事時（第 4-5 輪），在 [[END]] 之後加上結局元資料，用 JSON 格式包裝，前端會解析做成分享卡。格式：
+
+[[END]]
+META:{
+  "title": "劇名（4-8字，有戲劇張力，像短劇標題）",
+  "endingType": "好結局 / 壞結局 / 懸念結局 三選一",
+  "verdict": "AI 對玩家的判詞（10-20字，帶幽默或哲理，像墓誌銘）"
+}
+
+例如：
+大白菜變成了一鍋熱湯，滋養了一家人。[[END]]
+META:{"title":"白菜的歸宿","endingType":"好結局","verdict":"你用生命煮了一鍋溫柔"}
+
+注意：
+- META 必須是合法 JSON
+- title 不要用引號
+- endingType 只能是「好結局」「壞結局」「懸念結局」這三個值
+- verdict 要簡短有力，像墓誌銘或小語
 `;
 
 // 句子分段：依逗號、句號、驚嘆號、問號、分號切分
@@ -56,13 +76,34 @@ export function splitIntoSentences(text: string): string[] {
   return sentences.filter(s => s.length > 0);
 }
 
-// 偵測結局標記
-export function detectEnding(text: string): { content: string; isEnding: boolean } {
+// 偵測結局標記 + META
+export interface EndingMeta {
+  title: string
+  endingType: string
+  verdict: string
+}
+
+export function detectEnding(text: string): { content: string; isEnding: boolean; meta?: EndingMeta } {
   if (text.includes('[[END]]')) {
-    return {
-      content: text.replace(/\[\[END\]\]/g, '').trim(),
-      isEnding: true,
-    };
+    let meta: EndingMeta | undefined
+    let content = text
+
+    // 嘗試解析 META JSON
+    const metaMatch = text.match(/META:\s*(\{[^}]+\})/s)
+    if (metaMatch) {
+      try {
+        meta = JSON.parse(metaMatch[1])
+        // 移除 META 部分
+        content = text.replace(/\[\[END\]\][\s\S]*$/, '').trim()
+      } catch {
+        // JSON 解析失敗，還是當結局但沒 meta
+        content = text.replace(/\[\[END\]\][\s\S]*$/, '').trim()
+      }
+    } else {
+      content = text.replace(/\[\[END\]\]/g, '').trim()
+    }
+
+    return { content, isEnding: true, meta }
   }
-  return { content: text, isEnding: false };
+  return { content: text, isEnding: false }
 }

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { io, Socket } from 'socket.io-client'
-import { Mic, Square, Loader2, RefreshCw, Volume2, VolumeX } from 'lucide-react'
+import { Mic, Square, Loader2, RefreshCw, Volume2, VolumeX, Share2, Twitter, Copy, Lock } from 'lucide-react'
 
 // ============ Types ============
 type Phase = 'idle' | 'connecting' | 'narrating' | 'recording' | 'transcribing' | 'ended'
@@ -13,8 +13,41 @@ interface SubtitleChunk {
   role: 'narrator' | 'user'
 }
 
+interface EndingMeta {
+  title: string
+  endingType: string
+  verdict: string
+}
+
 // ============ Constants ============
 const AUDIO_PLAYBACK_RATE = 1.0
+const DAILY_FREE_LIMIT = 3
+const STORAGE_KEY_DATE = 'lbb_date'
+const STORAGE_KEY_COUNT = 'lbb_count'
+
+// ============ Helpers: Daily limit ============
+function getDailyCount(): { date: string; count: number } {
+  if (typeof window === 'undefined') return { date: '', count: 0 }
+  const today = new Date().toISOString().slice(0, 10)
+  const storedDate = localStorage.getItem(STORAGE_KEY_DATE) || ''
+  const storedCount = parseInt(localStorage.getItem(STORAGE_KEY_COUNT) || '0', 10)
+  if (storedDate !== today) {
+    // 重置
+    localStorage.setItem(STORAGE_KEY_DATE, today)
+    localStorage.setItem(STORAGE_KEY_COUNT, '0')
+    return { date: today, count: 0 }
+  }
+  return { date: today, count: storedCount }
+}
+
+function incrementDailyCount(): number {
+  if (typeof window === 'undefined') return 0
+  const { date, count } = getDailyCount()
+  const newCount = count + 1
+  localStorage.setItem(STORAGE_KEY_DATE, date)
+  localStorage.setItem(STORAGE_KEY_COUNT, String(newCount))
+  return newCount
+}
 
 // ============ Component ============
 export default function VoiceGamePage() {
@@ -28,6 +61,9 @@ export default function VoiceGamePage() {
   const [error, setError] = useState<string | null>(null)
   const [recordSeconds, setRecordSeconds] = useState(0)
   const [narrationText, setNarrationText] = useState('') // 即時累積的旁白
+  const [endingMeta, setEndingMeta] = useState<EndingMeta | null>(null)
+  const [dailyCount, setDailyCount] = useState(0)
+  const [copied, setCopied] = useState(false)
 
   // === Refs ===
   const socketRef = useRef<Socket | null>(null)
@@ -175,7 +211,10 @@ export default function VoiceGamePage() {
       setPhaseSafe('idle')
     })
 
-    socket.on('game_over', () => {
+    socket.on('game_over', (data: { ending?: string; meta?: EndingMeta }) => {
+      if (data?.meta) {
+        setEndingMeta(data.meta)
+      }
       setPhaseSafe('ended')
     })
 
@@ -194,6 +233,7 @@ export default function VoiceGamePage() {
       setSubtitles([])
       setTurn(0)
       setNarrationText('')
+      setEndingMeta(null)
       setPhaseSafe('idle')
       setError(null)
       interruptPlayback()
@@ -203,6 +243,17 @@ export default function VoiceGamePage() {
       socket.disconnect()
     }
   }, [handleAudioChunk, interruptPlayback, setPhaseSafe])
+
+  // ============ Daily count: 載入 + 每分鐘檢查重置 ============
+  useEffect(() => {
+    const { count } = getDailyCount()
+    setDailyCount(count)
+    const interval = setInterval(() => {
+      const { count: c } = getDailyCount()
+      setDailyCount(c)
+    }, 60000)
+    return () => clearInterval(interval)
+  }, [])
 
   // ============ Recording ============
   const startRecording = useCallback(async () => {
@@ -298,13 +349,23 @@ export default function VoiceGamePage() {
 
   // ============ Game Actions ============
   const startGame = useCallback(() => {
+    // 檢查 daily limit
+    const { count } = getDailyCount()
+    if (count >= DAILY_FREE_LIMIT) {
+      setError(`今日已玩 ${DAILY_FREE_LIMIT} 局免費額度，明天再來吧。`)
+      return
+    }
     setError(null)
     setSubtitles([])
     setNarrationText('')
+    setEndingMeta(null)
     setTurn(0)
     interruptPlayback()
     nextPlaySeqRef.current = 0
     setPhaseSafe('narrating')
+    // 開局時 increment
+    const newCount = incrementDailyCount()
+    setDailyCount(newCount)
     socketRef.current?.emit('start_game')
   }, [interruptPlayback, setPhaseSafe])
 
@@ -314,8 +375,69 @@ export default function VoiceGamePage() {
     socketRef.current?.emit('reset_game')
   }, [interruptPlayback])
 
+  // ============ Share helpers ============
+  const buildShareText = useCallback(() => {
+    if (!endingMeta) return ''
+    const opening = subtitles.find(s => s.role === 'narrator')?.text || ''
+    const ending = subtitles.filter(s => s.role === 'narrator').slice(-1)[0]?.text || ''
+    return `【人生盲盒 · ${endingMeta.endingType}】${endingMeta.title}
+
+開場：${opening.slice(0, 50)}${opening.length > 50 ? '...' : ''}
+
+結局：${ending.slice(0, 50)}${ending.length > 50 ? '...' : ''}
+
+AI 判詞：${endingMeta.verdict}
+
+你的人生，5 分鐘一局：
+https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
+  }, [endingMeta, subtitles])
+
+  const handleShareTwitter = useCallback(() => {
+    const text = buildShareText()
+    if (!text) return
+    window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}`, '_blank')
+  }, [buildShareText])
+
+  const handleShareCopy = useCallback(async () => {
+    const text = buildShareText()
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // fallback
+      const ta = document.createElement('textarea')
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    }
+  }, [buildShareText])
+
+  const handleShareNative = useCallback(async () => {
+    const text = buildShareText()
+    if (!text) return
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: '人生盲盒', text })
+      } catch {
+        // 用戶取消
+      }
+    } else {
+      handleShareCopy()
+    }
+  }, [buildShareText, handleShareCopy])
+
   // ============ Render ============
   const canRecord = connected && (phase === 'idle' || phase === 'narrating' || phase === 'transcribing') && phase !== 'ended'
+  const remainingToday = Math.max(0, DAILY_FREE_LIMIT - dailyCount)
+  const isOutOfCredits = remainingToday === 0 && phase === 'idle' && subtitles.length === 0
+  const openingText = subtitles.find(s => s.role === 'narrator')?.text || ''
+  const endingText = subtitles.filter(s => s.role === 'narrator').slice(-1)[0]?.text || ''
 
   return (
     <div className="min-h-screen bg-black text-white flex flex-col items-center justify-between p-6 relative overflow-hidden">
@@ -325,6 +447,7 @@ export default function VoiceGamePage() {
           phase === 'recording' ? 'bg-red-900/30 scale-110' :
           isPlaying ? 'bg-amber-900/30 scale-110' :
           phase === 'narrating' ? 'bg-indigo-900/20 scale-105' :
+          phase === 'ended' && endingMeta ? 'bg-purple-900/20 scale-105' :
           'bg-zinc-800/20 scale-100'
         }`} />
       </div>
@@ -352,6 +475,9 @@ export default function VoiceGamePage() {
           <span className="text-xs text-zinc-500 tracking-widest">
             TURN {turn} / 5
           </span>
+          <span className={`text-xs tracking-widest ${remainingToday === 0 ? 'text-red-400' : remainingToday === 1 ? 'text-amber-400' : 'text-zinc-500'}`}>
+            · {remainingToday}/{DAILY_FREE_LIMIT} LEFT
+          </span>
         </div>
       </header>
 
@@ -370,13 +496,28 @@ export default function VoiceGamePage() {
               每次開局都是一個隨機人生。5 分鐘、3-5 輪對話，沒有存檔、沒有重來。
               <br />按住下方按鈕說話，鬆手送出。
             </p>
-            <button
-              onClick={startGame}
-              disabled={!connected}
-              className="mt-4 px-8 py-3 rounded-full bg-white text-black font-medium tracking-wider hover:bg-zinc-200 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-            >
-              開啟盲盒
-            </button>
+            {isOutOfCredits ? (
+              <div className="space-y-3 mt-4">
+                <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-500 text-sm">
+                  <Lock size={14} />
+                  今日免費額度已用完
+                </div>
+                <p className="text-xs text-zinc-600">明天再來，或之後解鎖更多劇情包</p>
+              </div>
+            ) : (
+              <button
+                onClick={startGame}
+                disabled={!connected}
+                className="mt-4 px-8 py-3 rounded-full bg-white text-black font-medium tracking-wider hover:bg-zinc-200 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                開啟盲盒
+              </button>
+            )}
+            {remainingToday > 0 && remainingToday < DAILY_FREE_LIMIT && (
+              <p className="text-xs text-zinc-600 tracking-widest">
+                今日剩餘 {remainingToday} 局免費
+              </p>
+            )}
           </div>
         )}
 
@@ -437,31 +578,145 @@ export default function VoiceGamePage() {
           </div>
         )}
 
-        {/* Ended screen */}
+        {/* Ended screen with share card */}
         {phase === 'ended' && (
           <div className="text-center space-y-6">
             <p className="text-zinc-500 text-sm tracking-[0.3em] uppercase">The End</p>
-            <h2 className="text-4xl md:text-5xl font-serif">故事結束</h2>
-            <div className="max-w-xl mx-auto space-y-3 text-left max-h-64 overflow-y-auto">
-              {subtitles.map((s, i) => (
-                <div key={i} className={`text-sm leading-relaxed ${s.role === 'user' ? 'text-amber-300/80' : 'text-zinc-300'}`}>
-                  <span className="text-xs text-zinc-600 mr-2">
-                    {s.role === 'user' ? '你' : '旁白'}
-                  </span>
-                  {s.text}
+
+            {/* 結局分享卡 */}
+            {endingMeta ? (
+              <div className="max-w-md mx-auto">
+                <div className="relative rounded-2xl border border-zinc-800 bg-gradient-to-br from-zinc-900 via-black to-zinc-900 p-8 shadow-2xl overflow-hidden">
+                  {/* 裝飾光 */}
+                  <div className={
+                    'absolute -top-20 -right-20 w-40 h-40 rounded-full blur-3xl opacity-30 ' +
+                    (endingMeta.endingType === '好結局'
+                      ? 'bg-emerald-500'
+                      : endingMeta.endingType === '壞結局'
+                      ? 'bg-red-500'
+                      : 'bg-purple-500')
+                  } />
+
+                  {/* 結局類型徽章 */}
+                  <div className="flex justify-center mb-4">
+                    <span className={
+                      'inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs tracking-widest ' +
+                      (endingMeta.endingType === '好結局'
+                        ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-700'
+                        : endingMeta.endingType === '壞結局'
+                        ? 'bg-red-900/50 text-red-300 border border-red-700'
+                        : 'bg-purple-900/50 text-purple-300 border border-purple-700')
+                    }>
+                      {endingMeta.endingType}
+                    </span>
+                  </div>
+
+                  {/* 劇名 */}
+                  <h2 className="text-3xl md:text-4xl font-serif font-bold mb-2">
+                    {endingMeta.title}
+                  </h2>
+
+                  {/* 開場 */}
+                  {openingText && (
+                    <div className="mt-6 text-left">
+                      <p className="text-xs text-zinc-600 tracking-widest mb-1">開場</p>
+                      <p className="text-sm text-zinc-400 italic line-clamp-3">
+                        {openingText}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* 結局 */}
+                  {endingText && (
+                    <div className="mt-4 text-left">
+                      <p className="text-xs text-zinc-600 tracking-widest mb-1">結局</p>
+                      <p className="text-sm text-zinc-300 line-clamp-3">
+                        {endingText}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* AI 判詞 */}
+                  <div className="mt-6 pt-6 border-t border-zinc-800">
+                    <p className="text-xs text-zinc-600 tracking-widest mb-2">AI 判詞</p>
+                    <p className="text-lg font-serif italic text-amber-200">
+                      「{endingMeta.verdict}」
+                    </p>
+                  </div>
+
+                  {/* 水印 */}
+                  <p className="mt-6 text-[10px] text-zinc-700 tracking-widest">
+                    人生盲盒 · LIFE BLIND BOX
+                  </p>
                 </div>
-              ))}
-            </div>
-            <button
-              onClick={() => {
-                resetGame()
-                setTimeout(() => startGame(), 300)
-              }}
-              className="mt-4 inline-flex items-center gap-2 px-6 py-3 rounded-full bg-white text-black font-medium tracking-wider hover:bg-zinc-200 transition-all"
-            >
-              <RefreshCw size={16} />
-              再開一盒
-            </button>
+
+                {/* 分享按鈕 */}
+                <div className="flex flex-wrap justify-center gap-2 mt-4">
+                  <button
+                    onClick={handleShareNative}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white text-black text-sm font-medium hover:bg-zinc-200 transition-all"
+                  >
+                    <Share2 size={14} />
+                    分享
+                  </button>
+                  <button
+                    onClick={handleShareTwitter}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-zinc-900 border border-zinc-700 text-zinc-300 text-sm hover:bg-zinc-800 transition-all"
+                  >
+                    <Twitter size={14} />
+                    發到 X
+                  </button>
+                  <button
+                    onClick={handleShareCopy}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-zinc-900 border border-zinc-700 text-zinc-300 text-sm hover:bg-zinc-800 transition-all"
+                  >
+                    <Copy size={14} />
+                    {copied ? '已複製 ✓' : '複製文字'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <h2 className="text-4xl md:text-5xl font-serif">故事結束</h2>
+            )}
+
+            {/* 完整對話紀錄（折疊） */}
+            <details className="max-w-xl mx-auto text-sm">
+              <summary className="text-zinc-500 cursor-pointer hover:text-zinc-300 transition-colors">
+                查看完整對話紀錄（{subtitles.length}）
+              </summary>
+              <div className="mt-4 space-y-3 max-h-64 overflow-y-auto text-left pr-2">
+                {subtitles.map((s, i) => (
+                  <div key={i} className={`text-sm leading-relaxed ${s.role === 'user' ? 'text-amber-300/80' : 'text-zinc-300'}`}>
+                    <span className="text-xs text-zinc-600 mr-2">
+                      {s.role === 'user' ? '你' : '旁白'}
+                    </span>
+                    {s.text}
+                  </div>
+                ))}
+              </div>
+            </details>
+
+            {/* 再開一盒 */}
+            {remainingToday > 0 ? (
+              <button
+                onClick={() => {
+                  resetGame()
+                  setTimeout(() => startGame(), 300)
+                }}
+                disabled={remainingToday === 0}
+                className="mt-4 inline-flex items-center gap-2 px-6 py-3 rounded-full bg-white text-black font-medium tracking-wider hover:bg-zinc-200 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <RefreshCw size={16} />
+                再開一盒（{remainingToday} 局剩餘）
+              </button>
+            ) : (
+              <div className="mt-4 space-y-2">
+                <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-500 text-sm">
+                  <Lock size={14} />
+                  今日額度已用完，明天再來
+                </div>
+              </div>
+            )}
           </div>
         )}
       </main>

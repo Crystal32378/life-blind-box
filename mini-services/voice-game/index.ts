@@ -1,7 +1,7 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
 import ZAI from 'z-ai-web-dev-sdk'
-import { SYSTEM_PROMPT, splitIntoSentences, detectEnding } from './prompt'
+import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
 
 // ====== Types ======
 interface GameState {
@@ -255,14 +255,15 @@ const MIN_TTS_INTERVAL_MS = 1200 // 兩次 TTS 啟動之間至少間隔 1200ms�
 async function streamNarration(
   socket: any,
   messages: Array<{ role: string; content: string }>,
-  onFullText?: (text: string, isEnding: boolean) => void,
+  onFullText?: (text: string, isEnding: boolean, meta?: EndingMeta) => void,
   abortSignal?: AbortSignal,
   onLLMDone?: () => void,
-): Promise<{ fullText: string; isEnding: boolean }> {
+): Promise<{ fullText: string; isEnding: boolean; meta?: EndingMeta }> {
   let buffer = ''
   let fullText = ''
   let seq = 0
   let isEnding = false
+  let endingMeta: EndingMeta | undefined
 
   // 並行 TTS：每個 sentence 起一個 Promise，完成後 emit。
   const ttsPromises: Promise<void>[] = []
@@ -271,8 +272,11 @@ async function streamNarration(
     const trimmed = sentence.trim()
     if (!trimmed) return
 
-    const { content, isEnding: ending } = detectEnding(trimmed)
-    if (ending) isEnding = true
+    const { content, isEnding: ending, meta } = detectEnding(trimmed)
+    if (ending) {
+      isEnding = true
+      if (meta) endingMeta = meta
+    }
 
     const cleanSentence = content
     if (!cleanSentence) return
@@ -346,8 +350,8 @@ async function streamNarration(
     console.error('[TTS background error]', err)
   })
 
-  onFullText?.(fullText, isEnding)
-  return { fullText, isEnding }
+  onFullText?.(fullText, isEnding, endingMeta)
+  return { fullText, isEnding, meta: endingMeta }
 }
 
 // ====== Socket handlers ======
@@ -446,12 +450,12 @@ io.on('connection', (socket) => {
       if (nextTurn >= MAX_TURNS - 1 && nextTurn < MAX_TURNS) {
         game.messages.push({
           role: 'assistant',
-          content: '（系統提示：這是最後一輪了，請給出一個明確的結局，並在結尾加上 [[END]] 標記。）',
+          content: '（系統提示：這是最後一輪了，請給出一個明確的結局。結尾必須是 [[END]] 加上 META JSON，格式如：[[END]]\\nMETA:{"title":"劇名","endingType":"好結局/壞結局/懸念結局","verdict":"AI 判詞"}）',
         })
       } else if (nextTurn >= MAX_TURNS) {
         game.messages.push({
           role: 'assistant',
-          content: '（系統提示：已達到 5 輪上限，必須立即結束故事，給出結局，並在結尾加上 [[END]] 標記。）',
+          content: '（系統提示：已達到 5 輪上限，必須立即結束故事，給出結局。結尾必須是 [[END]] 加上 META JSON，格式如：[[END]]\\nMETA:{"title":"劇名","endingType":"好結局/壞結局/懸念結局","verdict":"AI 判詞"}）',
         })
       }
 
@@ -461,10 +465,11 @@ io.on('connection', (socket) => {
       // 強制：前 3 輪（nextTurn <= 3）不允許 [[END]]，避免太早結束
       const allowEnding = nextTurn >= 4
       let detectedEnding = false
+      let endingMeta: EndingMeta | undefined
       const { isEnding } = await streamNarration(
         socket,
         game.messages,
-        (text, ending) => {
+        (text, ending, meta) => {
           // 前 3 輪：強制移除 [[END]]
           const cleanText = allowEnding ? text : text.replace(/\[\[END\]\]/g, '').trim()
           game.messages.push({ role: 'assistant', content: cleanText })
@@ -472,6 +477,7 @@ io.on('connection', (socket) => {
           if (allowEnding && ending) {
             detectedEnding = true
             game.ended = true
+            if (meta) endingMeta = meta
           }
         },
       )
@@ -484,7 +490,10 @@ io.on('connection', (socket) => {
       })
 
       if (finalEnding) {
-        socket.emit('game_over', { ending: 'auto' })
+        socket.emit('game_over', {
+          ending: 'auto',
+          meta: endingMeta,
+        })
       }
     } catch (err) {
       console.error('[submit_audio error]', err)
