@@ -2,6 +2,10 @@
 
 > Voice-first AI micro-drama platform. 5 分鐘一局，用說的推進劇情，AI 即興演繹。
 
+> **Current stage: 5–10 人 Trained Alpha (text + voice fallback)**
+> 不是 voice beta。是 trained alpha：Z.ai TTS 為主、字幕 fallback 為輔。
+> 詳見 [`docs/beta-stage-classification.md`](./docs/beta-stage-classification.md)
+
 每次開局隨機生成一個極端、詭異或平凡的場景——你可能是即將被丟進鍋裡的大白菜、被合夥人掃出公司的創辦人、或被困在玻璃罐裡的螢火蟲。3-5 輪語音對話內，AI 會把劇情推向一個結局（好結局 / 壞結局 / 懸念結局）。
 
 沒有存檔、沒有重來。體驗結束即銷毀。
@@ -201,12 +205,16 @@ See [`mini-services/voice-game/scene-templates.ts`](./mini-services/voice-game/s
 
 ### 1. TTS rate limiting (429)
 The Z.ai TTS API has aggressive rate limits. We mitigate with:
-- Semaphore(2) for concurrent TTS calls
-- 300ms minimum interval between TTS starts
-- Exponential backoff retry (1.5s → 3s → 6s)
+- TTS circuit breaker (per-session + global, see `tts-circuit-breaker.ts`)
+- Semaphore(1) for concurrent TTS calls (reduced from 2 for beta fragile window)
+- 1500ms minimum interval between TTS starts (increased from 300ms)
+- When circuit opens: auto-switch to text-only fallback UI ("AI 嗆聲中，先用字幕模式演出")
 
-Under heavy load, some audio chunks may still fail and the user will see
-text without audio for that sentence.
+**OpenAI TTS fallback**: `implemented, not environment-verified`
+- Code complete (`openai-tts.ts` with official SDK)
+- Logic correct (TTS_PROVIDER=auto: Z.ai → 429 → OpenAI → both fail → text-only)
+- Cannot be tested in current sandbox (OpenAI API 403 region blocked)
+- Will be verified after deploying to Railway / Render / Fly.io
 
 ### 2. Single-process voice-game service
 The voice-game service runs as a single Bun process. No clustering,
