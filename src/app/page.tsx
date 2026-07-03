@@ -19,6 +19,13 @@ interface EndingMeta {
   verdict: string
 }
 
+interface SceneTemplateInfo {
+  id: string
+  category: string
+  categoryZh: string
+  categoryEn: string
+}
+
 // ============ Constants ============
 const AUDIO_PLAYBACK_RATE = 1.0
 const DAILY_FREE_LIMIT = 3
@@ -64,6 +71,7 @@ export default function VoiceGamePage() {
   const [endingMeta, setEndingMeta] = useState<EndingMeta | null>(null)
   const [dailyCount, setDailyCount] = useState(0)
   const [copied, setCopied] = useState(false)
+  const [sceneTemplate, setSceneTemplate] = useState<SceneTemplateInfo | null>(null)
 
   // === Refs ===
   const socketRef = useRef<Socket | null>(null)
@@ -204,6 +212,10 @@ export default function VoiceGamePage() {
     socket.on('turn_start', (data: { turn: number }) => {
       setTurn(data.turn)
       setNarrationText('')
+    })
+
+    socket.on('scene_template', (data: SceneTemplateInfo) => {
+      setSceneTemplate(data)
     })
 
     socket.on('turn_complete', (data: { turn: number; isEnding: boolean }) => {
@@ -359,6 +371,7 @@ export default function VoiceGamePage() {
     setSubtitles([])
     setNarrationText('')
     setEndingMeta(null)
+    setSceneTemplate(null)
     setTurn(0)
     interruptPlayback()
     nextPlaySeqRef.current = 0
@@ -372,6 +385,7 @@ export default function VoiceGamePage() {
   const resetGame = useCallback(() => {
     interruptPlayback()
     nextPlaySeqRef.current = 0
+    setSceneTemplate(null)
     socketRef.current?.emit('reset_game')
   }, [interruptPlayback])
 
@@ -380,7 +394,8 @@ export default function VoiceGamePage() {
     if (!endingMeta) return ''
     const opening = subtitles.find(s => s.role === 'narrator')?.text || ''
     const ending = subtitles.filter(s => s.role === 'narrator').slice(-1)[0]?.text || ''
-    return `【人生盲盒 · ${endingMeta.endingType}】${endingMeta.title}
+    const categoryLabel = sceneTemplate ? ` · ${sceneTemplate.categoryZh}` : ''
+    return `【人生盲盒${categoryLabel} · ${endingMeta.endingType}】${endingMeta.title}
 
 開場：${opening.slice(0, 50)}${opening.length > 50 ? '...' : ''}
 
@@ -390,7 +405,7 @@ AI 判詞：${endingMeta.verdict}
 
 你的人生，5 分鐘一局：
 https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
-  }, [endingMeta, subtitles])
+  }, [endingMeta, subtitles, sceneTemplate])
 
   const handleShareTwitter = useCallback(() => {
     const text = buildShareText()
@@ -459,6 +474,11 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
           <span className="text-xs text-zinc-400 tracking-widest uppercase">
             {connected ? 'CONNECTED' : 'CONNECTING...'}
           </span>
+          {sceneTemplate && phase !== 'idle' && (
+            <span className="text-xs text-amber-400/70 tracking-widest">
+              · {sceneTemplate.categoryZh}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-3">
           <button
@@ -582,6 +602,13 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
         {phase === 'ended' && (
           <div className="text-center space-y-6">
             <p className="text-zinc-500 text-sm tracking-[0.3em] uppercase">The End</p>
+
+            {/* 場景類別標籤 */}
+            {sceneTemplate && (
+              <p className="text-xs text-zinc-600 tracking-widest">
+                {sceneTemplate.categoryZh} · {sceneTemplate.categoryEn}
+              </p>
+            )}
 
             {/* 結局分享卡 */}
             {endingMeta ? (

@@ -2,6 +2,7 @@ import { createServer } from 'http'
 import { Server } from 'socket.io'
 import { openai, getZAI, LLM_MODEL, TTS_VOICE } from './openai-client'
 import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
+import { pickRandomTemplate, templateToOpeningPrompt, SceneTemplate, CATEGORY_NAMES, SceneCategory } from './scene-templates'
 
 // ====== Types ======
 interface GameState {
@@ -9,6 +10,7 @@ interface GameState {
   turnCount: number
   ended: boolean
   sessionId: string
+  template?: SceneTemplate  // 這一局抽到的場景模板
 }
 
 interface PendingTTS {
@@ -370,18 +372,30 @@ io.on('connection', (socket) => {
       return
     }
 
-    console.log(`[start_game] ${socket.id}`)
+    // 抽一個 scene template
+    const template = pickRandomTemplate()
+    game.template = template
+    console.log(`[start_game] ${socket.id} template=${template.id} (${template.category})`)
+
     socket.emit('turn_start', { turn: 0 })
 
+    // 把 template 資訊告訴前端（讓前端可以顯示類別）
+    socket.emit('scene_template', {
+      id: template.id,
+      category: template.category,
+      categoryZh: CATEGORY_NAMES[template.category as SceneCategory]?.zh || template.category,
+      categoryEn: CATEGORY_NAMES[template.category as SceneCategory]?.en || template.category,
+    })
+
     try {
-      // 加入一個 user message 觸發 LLM 開始（GLM API 要求至少一個 user message）
-      const trigger = '請隨機生成一個開場白，直接開始遊戲。記得：開場白絕對不要使用 [[END]] 標記。'
+      // 用 template 生成開場引子，注入 LLM prompt
+      const trigger = templateToOpeningPrompt(template)
       const messagesForLLM = [
         ...game.messages,
         { role: 'user', content: trigger },
       ]
 
-      const { fullText, isEnding } = await streamNarration(
+      await streamNarration(
         socket,
         messagesForLLM,
         (text, ending) => {
