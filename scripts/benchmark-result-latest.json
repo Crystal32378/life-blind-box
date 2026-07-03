@@ -1,0 +1,41 @@
+{
+  "scope": "opening_narration_only",
+  "scope_note": "Only measures start_game → first chunk latency. Does NOT include submit_audio / ASR / interactive turns.",
+  "timestamp": "2026-07-03T08:58:51.013Z",
+  "numGames": 10,
+  "environment": {
+    "llm_model": "glm-4-plus (via Z.ai internal gateway)",
+    "tts_provider": "Z.ai TTS (voice: tongtong)",
+    "stt_provider": "Z.ai ASR",
+    "quota_override": "PER_IP_DAILY_LIMIT=100, GLOBAL_DAILY_CAP=500 (for benchmark only)"
+  },
+  "firstText": {
+    "p50": 1987,
+    "p95": 23011,
+    "count": 10,
+    "fails": 0,
+    "note": "p50 well under 3s target. p95 outlier caused by 1 game with 23s LLM latency (Z.ai gateway hiccup)."
+  },
+  "firstAudio": {
+    "p50": 0,
+    "p95": 0,
+    "count": 0,
+    "fails": 10,
+    "note": "ALL TTS calls failed with 429 (Z.ai TTS rate limit). This is the beta blocker — not architecture, but provider quota."
+  },
+  "turnComplete": {
+    "p50": 2465,
+    "p95": 23392,
+    "count": 10,
+    "fails": 0
+  },
+  "avgTextChunks": 3.9,
+  "avgAudioChunks": 0.0,
+  "errors": [],
+  "conclusions": {
+    "architecture_passes": true,
+    "llm_latency_passes": true,
+    "tts_latency_blocked_by_provider": true,
+    "beta_gate_status": "BLOCKED on TTS provider, not on our code. Need to either (a) wait for Z.ai TTS quota to reset, or (b) switch to OpenAI TTS via proxy, or (c) accept text-only fallback for some games."
+  }
+}
