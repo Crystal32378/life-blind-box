@@ -1,5 +1,7 @@
 // 人生盲盒 System Prompt
-// 核心規則：隨機開局、零數值、5 分鐘限制、戲劇化語氣
+// 核心規則：隨機開局、零數值、5 分鐘限制、戲劇化語氣 + 內容安全
+
+import { SAFETY_SYSTEM_PROMPT_ADDON } from './safety'
 
 export const SYSTEM_PROMPT = `你是一個「人生盲盒」的旁白與互動者。這是一個 5 分鐘的互動式聲音短劇，玩家透過語音跟你對話推進劇情。
 
@@ -41,6 +43,7 @@ META:{"title":"白菜的歸宿","endingType":"好結局","verdict":"你用生命
 - title 不要用引號
 - endingType 只能是「好結局」「壞結局」「懸念結局」這三個值
 - verdict 要簡短有力，像墓誌銘或小語
+${SAFETY_SYSTEM_PROMPT_ADDON}
 `;
 
 // 句子分段：依逗號、句號、驚嘆號、問號、分號切分

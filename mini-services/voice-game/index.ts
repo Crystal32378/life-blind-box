@@ -1,8 +1,12 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
+import { randomUUID } from 'crypto'
 import { openai, getZAI, LLM_MODEL, TTS_VOICE } from './openai-client'
 import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
 import { pickRandomTemplate, pickTemplateByCategory, templateToOpeningPrompt, SceneTemplate, CATEGORY_NAMES, SceneCategory, SCENE_TEMPLATES } from './scene-templates'
+import { usageLogger, logUsage, UsageLogger } from './usage-logger'
+import { QuotaChecker } from './quota'
+import { checkContentSafety, checkLLMOutput, checkUserInput, SAFETY_FALLBACK_NARRATION } from './safety'
 
 // ====== Types ======
 interface GameState {
@@ -11,6 +15,8 @@ interface GameState {
   ended: boolean
   sessionId: string
   template?: SceneTemplate  // 這一局抽到的場景模板
+  currentGenerationId: string  // 當前有效的 generation（用來 discard 舊事件）
+  anonUserId: string  // 匿名用戶 ID（IP hash）
 }
 
 interface PendingTTS {
@@ -254,15 +260,26 @@ async function streamNarration(
   onFullText?: (text: string, isEnding: boolean, meta?: EndingMeta) => void,
   abortSignal?: AbortSignal,
   onLLMDone?: () => void,
+  ids?: { sessionId: string; turnId: number; generationId: string },
 ): Promise<{ fullText: string; isEnding: boolean; meta?: EndingMeta }> {
+  const sessionId = ids?.sessionId || ''
+  const turnId = ids?.turnId ?? 0
+  const generationId = ids?.generationId || ''
+
   let buffer = ''
   let fullText = ''
   let seq = 0
   let isEnding = false
   let endingMeta: EndingMeta | undefined
+  let retryCount = 0
 
   // 並行 TTS：每個 sentence 起一個 Promise，完成後 emit。
   const ttsPromises: Promise<void>[] = []
+
+  // latency tracking
+  const turnStart = Date.now()
+  let llmFirstTokenMs = 0
+  let ttsFirstAudioMs = 0
 
   const flushSentence = (sentence: string) => {
     const trimmed = sentence.trim()
@@ -277,9 +294,33 @@ async function streamNarration(
     const cleanSentence = content
     if (!cleanSentence) return
 
+    // ====== 內容安全檢查 ======
+    const safetyCheck = checkLLMOutput(cleanSentence)
+    if (!safetyCheck.safe) {
+      // 用 fallback 取代，記錄 reason
+      console.warn(`[safety] LLM output blocked: ${safetyCheck.reason}, using fallback`)
+      logUsage({
+        session_id: sessionId,
+        anon_user_id: '',  // 由 caller 補
+        turn_id: turnId,
+        generation_id: generationId,
+        event_type: 'safety_block',
+        timestamp: new Date().toISOString(),
+        error_code: safetyCheck.reason,
+        extra: { original_text_preview: cleanSentence.slice(0, 80) },
+      })
+    }
+    const finalSentence = safetyCheck.safe ? cleanSentence : (safetyCheck.fallback || '')
+
     const currentSeq = seq++
-    // 同步 emit text chunk（讓前端即時顯示字幕）
-    socket.emit('text_chunk', { seq: currentSeq, text: cleanSentence })
+    // 同步 emit text chunk（讓前端即時顯示字幕）—— 帶完整 ID
+    socket.emit('text_chunk', {
+      sessionId,
+      turnId,
+      generationId,
+      seq: currentSeq,
+      text: finalSentence,
+    })
 
     // 並行發起 TTS，但 semaphore 限制並行 + 節流
     const p = (async () => {
@@ -294,19 +335,38 @@ async function streamNarration(
 
         if (abortSignal?.aborted) return
         const t0 = Date.now()
-        const audioBuffer = await textToSpeechWav(cleanSentence)
+        const audioBuffer = await textToSpeechWav(finalSentence)
         if (abortSignal?.aborted) return
         if (audioBuffer.length > 0) {
           socket.emit('audio_chunk', {
+            sessionId,
+            turnId,
+            generationId,
             seq: currentSeq,
             audio: audioBuffer.toString('base64'),
             format: 'wav',
           })
-          console.log(`[TTS] seq=${currentSeq} size=${audioBuffer.length} time=${Date.now() - t0}ms`)
+          if (!ttsFirstAudioMs) ttsFirstAudioMs = Date.now() - turnStart
+          console.log(`[TTS] gen=${generationId.slice(0,8)} seq=${currentSeq} size=${audioBuffer.length} time=${Date.now() - t0}ms`)
         }
-      } catch (err) {
-        console.error('[TTS error]', err)
-        socket.emit('tts_error', { seq: currentSeq, error: String(err) })
+      } catch (err: any) {
+        retryCount++
+        console.error('[TTS error]', err?.message || err)
+        socket.emit('tts_error', {
+          sessionId, turnId, generationId, seq: currentSeq,
+          error: String(err?.message || err).slice(0, 200),
+        })
+        logUsage({
+          session_id: sessionId,
+          anon_user_id: '',
+          turn_id: turnId,
+          generation_id: generationId,
+          event_type: 'tts_error',
+          timestamp: new Date().toISOString(),
+          retry_count: retryCount,
+          error_code: String(err?.status || err?.code || 'TTS_FAIL'),
+          extra: { seq: currentSeq },
+        })
       } finally {
         ttsSemaphore.release()
       }
@@ -317,6 +377,7 @@ async function streamNarration(
   await streamLLM(
     messages,
     (delta) => {
+      if (!llmFirstTokenMs) llmFirstTokenMs = Date.now() - turnStart
       buffer += delta
       fullText += delta
       // 嘗試切出完整句
@@ -340,6 +401,20 @@ async function streamNarration(
   // LLM 結束，立刻通知（不等 TTS），讓前端可以早點切回 idle / 允許玩家搶話
   onLLMDone?.()
 
+  // 記錄 latency
+  logUsage({
+    session_id: sessionId,
+    anon_user_id: '',
+    turn_id: turnId,
+    generation_id: generationId,
+    event_type: 'turn_llm_done',
+    timestamp: new Date().toISOString(),
+    llm_first_token_ms: llmFirstTokenMs,
+    llm_total_ms: Date.now() - turnStart,
+    tts_first_audio_ms: ttsFirstAudioMs,
+    retry_count: retryCount,
+  })
+
   // 把 TTS 完成的等待交給背景，回傳 LLM 結果
   // 不 await — 讓 TTS 在背景跑，audio_chunk 陸續推送
   Promise.all(ttsPromises).catch(err => {
@@ -354,70 +429,26 @@ async function streamNarration(
 
 io.on('connection', (socket) => {
   console.log(`[connect] ${socket.id}`)
+
+  // 從 socket handshake 取 IP 並 hash 成 anon_user_id
+  const rawIp = (socket.handshake as any)?.address || socket.id
+  const anonUserId = UsageLogger.hashUserId(rawIp)
+
   games.set(socket.id, {
     messages: [{ role: 'assistant', content: SYSTEM_PROMPT }],
     turnCount: 0,
     ended: false,
     sessionId: socket.id,
+    currentGenerationId: '',
+    anonUserId,
   })
 
-  socket.emit('connected', { sessionId: socket.id })
-
-  // 開始遊戲：生成開場白（可選 category，不傳就完全隨機）
-  socket.on('start_game', async (payload?: { category?: string }) => {
-    const game = games.get(socket.id)
-    if (!game) return
-    if (game.ended) {
-      socket.emit('error_msg', { message: '遊戲已結束，請重新開始' })
-      return
-    }
-
-    // 抽一個 scene template（有指定 category 就從該類別抽，否則完全隨機）
-    const category = payload?.category as SceneCategory | undefined
-    const template = category ? pickTemplateByCategory(category) : pickRandomTemplate()
-    game.template = template
-    console.log(`[start_game] ${socket.id} template=${template.id} (category=${template.category}, requested=${category || 'random'})`)
-
-    socket.emit('turn_start', { turn: 0 })
-
-    // 把 template 資訊告訴前端（讓前端可以顯示類別）
-    socket.emit('scene_template', {
-      id: template.id,
-      category: template.category,
-      categoryZh: CATEGORY_NAMES[template.category as SceneCategory]?.zh || template.category,
-      categoryEn: CATEGORY_NAMES[template.category as SceneCategory]?.en || template.category,
-    })
-
-    try {
-      // 用 template 生成開場引子，注入 LLM prompt
-      const trigger = templateToOpeningPrompt(template)
-      const messagesForLLM = [
-        ...game.messages,
-        { role: 'user', content: trigger },
-      ]
-
-      await streamNarration(
-        socket,
-        messagesForLLM,
-        (text, ending) => {
-          game.messages.push({ role: 'user', content: trigger })
-          // 開場白強制不結束（即使 LLM 誤加 [[END]]）
-          const cleanText = text.replace(/\[\[END\]\]/g, '').trim()
-          game.messages.push({ role: 'assistant', content: cleanText })
-          game.turnCount = 1
-          // 開場白永遠不結束遊戲
-        },
-      )
-
-      // 開場白永遠回傳 isEnding=false
-      socket.emit('turn_complete', {
-        turn: game.turnCount,
-        isEnding: false,
-      })
-    } catch (err) {
-      console.error('[start_game error]', err)
-      socket.emit('error_msg', { message: '開場生成失敗，請重試' })
-    }
+  // 連線成功 → 送 sessionId + 額度狀態
+  const quotaStatus = QuotaChecker.getStatus(anonUserId)
+  socket.emit('connected', {
+    sessionId: socket.id,
+    anonUserId,
+    quota: quotaStatus,
   })
 
   // 列出所有可用類別（給前端顯示用）
@@ -429,6 +460,136 @@ io.on('connection', (socket) => {
       count: SCENE_TEMPLATES.filter(t => t.category === key).length,
     }))
     socket.emit('categories_list', { categories })
+  })
+
+  // 開始遊戲：生成開場白（可選 category，不傳就完全隨機）
+  socket.on('start_game', async (payload?: { category?: string }) => {
+    const game = games.get(socket.id)
+    if (!game) return
+    if (game.ended) {
+      socket.emit('error_msg', { message: '遊戲已結束，請重新開始' })
+      return
+    }
+
+    // ====== P0-2: server-side quota check ======
+    const quotaCheck = QuotaChecker.checkCanStart(game.anonUserId)
+    if (!quotaCheck.ok) {
+      console.warn(`[quota] start_game blocked: ${quotaCheck.reason}`)
+      socket.emit('error_msg', {
+        message: quotaCheck.reason === 'BETA_DISABLED'
+          ? 'Beta 暫時關閉維護中，稍後再來。'
+          : '今日遊玩額度已達上限，明天再來吧。',
+        code: quotaCheck.reason,
+      })
+      logUsage({
+        session_id: socket.id,
+        anon_user_id: game.anonUserId,
+        turn_id: 0,
+        generation_id: '',
+        event_type: 'quota_blocked',
+        timestamp: new Date().toISOString(),
+        error_code: quotaCheck.reason,
+      })
+      return
+    }
+
+    // ====== 記錄開局 + 抽 template ======
+    QuotaChecker.recordStart(game.anonUserId)
+    const category = payload?.category as SceneCategory | undefined
+    const template = category ? pickTemplateByCategory(category) : pickRandomTemplate()
+    game.template = template
+    game.currentGenerationId = randomUUID()  // 新的 generation
+
+    const turnId = 0  // 開場算 turn 0
+    const generationId = game.currentGenerationId
+
+    console.log(`[start_game] ${socket.id} template=${template.id} gen=${generationId.slice(0,8)}`)
+
+    // 送 turn_start（帶 ID）
+    socket.emit('turn_start', { sessionId: socket.id, turnId, generationId, turn: 0 })
+
+    // 送 scene_template（帶 ID）
+    socket.emit('scene_template', {
+      sessionId: socket.id,
+      turnId,
+      generationId,
+      id: template.id,
+      category: template.category,
+      categoryZh: CATEGORY_NAMES[template.category as SceneCategory]?.zh || template.category,
+      categoryEn: CATEGORY_NAMES[template.category as SceneCategory]?.en || template.category,
+    })
+
+    // 記錄開局事件
+    logUsage({
+      session_id: socket.id,
+      anon_user_id: game.anonUserId,
+      turn_id: turnId,
+      generation_id: generationId,
+      event_type: 'game_start',
+      timestamp: new Date().toISOString(),
+      category: template.category,
+      template_id: template.id,
+    })
+
+    try {
+      const trigger = templateToOpeningPrompt(template)
+      const messagesForLLM = [
+        ...game.messages,
+        { role: 'user', content: trigger },
+      ]
+
+      const turnStart = Date.now()
+      await streamNarration(
+        socket,
+        messagesForLLM,
+        (text, ending) => {
+          game.messages.push({ role: 'user', content: trigger })
+          const cleanText = text.replace(/\[\[END\]\]/g, '').trim()
+          game.messages.push({ role: 'assistant', content: cleanText })
+          game.turnCount = 1
+        },
+        undefined,  // abortSignal
+        undefined,  // onLLMDone
+        { sessionId: socket.id, turnId, generationId },
+      )
+
+      // 開場白永遠回傳 isEnding=false（帶 ID）
+      socket.emit('turn_complete', {
+        sessionId: socket.id,
+        turnId,
+        generationId,
+        turn: game.turnCount,
+        isEnding: false,
+      })
+
+      logUsage({
+        session_id: socket.id,
+        anon_user_id: game.anonUserId,
+        turn_id: turnId,
+        generation_id: generationId,
+        event_type: 'turn_complete',
+        timestamp: new Date().toISOString(),
+        completed: true,
+        extra: { turn_total_ms: Date.now() - turnStart },
+      })
+    } catch (err: any) {
+      console.error('[start_game error]', err?.message || err)
+      socket.emit('error_msg', {
+        sessionId: socket.id, turnId, generationId,
+        message: '開場生成失敗，請重試',
+        code: 'START_GAME_FAIL',
+      })
+      logUsage({
+        session_id: socket.id,
+        anon_user_id: game.anonUserId,
+        turn_id: turnId,
+        generation_id: generationId,
+        event_type: 'turn_error',
+        timestamp: new Date().toISOString(),
+        error_code: String(err?.code || err?.status || 'LLM_FAIL'),
+        dropped: true,
+      })
+    }
   })
 
   // 提交錄音：base64 音訊
@@ -445,27 +606,107 @@ io.on('connection', (socket) => {
       return
     }
 
-    console.log(`[submit_audio] ${socket.id} size=${payload.audio.length}`)
+    // ====== P0-2: audio size check ======
+    const audioBytes = Math.floor(payload.audio.length * 0.75)  // base64 → bytes 估計
+    const sizeCheck = QuotaChecker.checkAudioSize(audioBytes)
+    if (!sizeCheck.ok) {
+      socket.emit('error_msg', {
+        message: '錄音太長了，請控制在 60 秒內。',
+        code: sizeCheck.reason,
+      })
+      return
+    }
+
+    // ====== 每次搶話都生成新 generationId（舊的 discard） ======
+    const nextTurn = game.turnCount + 1
+    const generationId = randomUUID()
+    game.currentGenerationId = generationId  // 這行之後，舊 generation 的 emit 前端會 discard
+
+    console.log(`[submit_audio] ${socket.id} gen=${generationId.slice(0,8)} bytes=${audioBytes} turn=${nextTurn}`)
 
     try {
       // 1. STT
       const t0 = Date.now()
-      socket.emit('status', { stage: 'transcribing' })
+      socket.emit('status', { sessionId: socket.id, turnId: nextTurn, generationId, stage: 'transcribing' })
       const mimeType = payload.format || 'audio/webm'
       const userText = await speechToText(payload.audio, mimeType)
-      console.log(`[STT] ${socket.id} time=${Date.now() - t0}ms text="${userText}"`)
+      const asrLatency = Date.now() - t0
+      console.log(`[STT] ${socket.id} gen=${generationId.slice(0,8)} time=${asrLatency}ms text="${userText}"`)
 
       if (!userText || !userText.trim()) {
-        socket.emit('error_msg', { message: '聽不清楚，請再說一次' })
+        socket.emit('error_msg', {
+          sessionId: socket.id, turnId: nextTurn, generationId,
+          message: '聽不清楚，請再說一次',
+          code: 'ASR_EMPTY',
+        })
+        logUsage({
+          session_id: socket.id,
+          anon_user_id: game.anonUserId,
+          turn_id: nextTurn,
+          generation_id: generationId,
+          event_type: 'asr_empty',
+          timestamp: new Date().toISOString(),
+          asr_latency_ms: asrLatency,
+          audio_bytes_in: audioBytes,
+          error_code: 'ASR_EMPTY',
+        })
+        return
+      }
+
+      // ====== P0-4: 檢查使用者輸入安全性 ======
+      const userSafety = checkUserInput(userText)
+      if (!userSafety.safe) {
+        console.warn(`[safety] user input blocked: ${userSafety.reason}`)
+        // 不直接報錯，用 fallback 旁白帶過
+        const fallbackText = userSafety.fallback || '你說了些什麼，但風把聲音吹散了。鏡頭突然切到另一個場景。'
+        socket.emit('user_text', { sessionId: socket.id, turnId: nextTurn, generationId, text: '(系統：你的話被風吹散了)' })
+        game.messages.push({ role: 'user', content: '(玩家試圖說了一些被系統攔截的話，已轉向)' })
+
+        logUsage({
+          session_id: socket.id,
+          anon_user_id: game.anonUserId,
+          turn_id: nextTurn,
+          generation_id: generationId,
+          event_type: 'safety_block_user',
+          timestamp: new Date().toISOString(),
+          error_code: userSafety.reason,
+        })
+
+        // 直接用 fallback 旁白當作 LLM 回應
+        socket.emit('turn_start', { sessionId: socket.id, turnId: nextTurn, generationId, turn: nextTurn })
+        const seq = 0
+        socket.emit('text_chunk', { sessionId: socket.id, turnId: nextTurn, generationId, seq, text: fallbackText })
+        const audioBuffer = await textToSpeechWav(fallbackText)
+        if (audioBuffer.length > 0) {
+          socket.emit('audio_chunk', {
+            sessionId: socket.id, turnId: nextTurn, generationId, seq,
+            audio: audioBuffer.toString('base64'),
+            format: 'wav',
+          })
+        }
+        game.messages.push({ role: 'assistant', content: fallbackText })
+        game.turnCount = nextTurn
+        socket.emit('turn_complete', { sessionId: socket.id, turnId: nextTurn, generationId, turn: nextTurn, isEnding: false })
         return
       }
 
       // 把使用者說的話送回前端顯示
-      socket.emit('user_text', { text: userText })
+      socket.emit('user_text', { sessionId: socket.id, turnId: nextTurn, generationId, text: userText })
+
+      // 記錄 ASR 完成
+      logUsage({
+        session_id: socket.id,
+        anon_user_id: game.anonUserId,
+        turn_id: nextTurn,
+        generation_id: generationId,
+        event_type: 'asr_done',
+        timestamp: new Date().toISOString(),
+        asr_latency_ms: asrLatency,
+        audio_bytes_in: audioBytes,
+      })
 
       // 2. 加入對話歷史
       game.messages.push({ role: 'user', content: userText })
-      const nextTurn = game.turnCount + 1
 
       // 3. 提示 LLM 該收尾了
       if (nextTurn >= MAX_TURNS - 1 && nextTurn < MAX_TURNS) {
@@ -480,18 +721,17 @@ io.on('connection', (socket) => {
         })
       }
 
-      socket.emit('turn_start', { turn: nextTurn })
+      socket.emit('turn_start', { sessionId: socket.id, turnId: nextTurn, generationId, turn: nextTurn })
 
       // 4. 串流 LLM + TTS
-      // 強制：前 3 輪（nextTurn <= 3）不允許 [[END]]，避免太早結束
       const allowEnding = nextTurn >= 4
       let detectedEnding = false
       let endingMeta: EndingMeta | undefined
+      const turnStart = Date.now()
       const { isEnding } = await streamNarration(
         socket,
         game.messages,
         (text, ending, meta) => {
-          // 前 3 輪：強制移除 [[END]]
           const cleanText = allowEnding ? text : text.replace(/\[\[END\]\]/g, '').trim()
           game.messages.push({ role: 'assistant', content: cleanText })
           game.turnCount = nextTurn
@@ -501,36 +741,117 @@ io.on('connection', (socket) => {
             if (meta) endingMeta = meta
           }
         },
+        undefined,
+        undefined,
+        { sessionId: socket.id, turnId: nextTurn, generationId },
       )
 
       const finalEnding = allowEnding ? (isEnding || detectedEnding) : false
 
       socket.emit('turn_complete', {
+        sessionId: socket.id,
+        turnId: nextTurn,
+        generationId,
         turn: game.turnCount,
         isEnding: finalEnding,
       })
 
+      logUsage({
+        session_id: socket.id,
+        anon_user_id: game.anonUserId,
+        turn_id: nextTurn,
+        generation_id: generationId,
+        event_type: 'turn_complete',
+        timestamp: new Date().toISOString(),
+        completed: true,
+        ending_type: finalEnding ? endingMeta?.endingType : undefined,
+        extra: { turn_total_ms: Date.now() - turnStart, allow_ending: allowEnding },
+      })
+
       if (finalEnding) {
         socket.emit('game_over', {
+          sessionId: socket.id,
+          turnId: nextTurn,
+          generationId,
           ending: 'auto',
           meta: endingMeta,
         })
+        logUsage({
+          session_id: socket.id,
+          anon_user_id: game.anonUserId,
+          turn_id: nextTurn,
+          generation_id: generationId,
+          event_type: 'game_over',
+          timestamp: new Date().toISOString(),
+          completed: true,
+          ending_type: endingMeta?.endingType,
+          extra: endingMeta ? { title: endingMeta.title, verdict: endingMeta.verdict } : {},
+        })
       }
-    } catch (err) {
-      console.error('[submit_audio error]', err)
-      socket.emit('error_msg', { message: '處理失敗：' + String(err) })
+    } catch (err: any) {
+      console.error('[submit_audio error]', err?.message || err)
+      // P0-6: fallback — 送一個 fallback 旁白而不是硬報錯
+      const fallbackMsg = '一陣雜訊干擾了你的訊號，畫面短暫失焦。請再說一次你想做什麼。'
+      socket.emit('error_msg', {
+        sessionId: socket.id, turnId: nextTurn, generationId,
+        message: fallbackMsg,
+        code: String(err?.code || err?.status || 'TURN_FAIL'),
+      })
+      logUsage({
+        session_id: socket.id,
+        anon_user_id: game.anonUserId,
+        turn_id: nextTurn,
+        generation_id: generationId,
+        event_type: 'turn_error',
+        timestamp: new Date().toISOString(),
+        error_code: String(err?.code || err?.status || 'TURN_FAIL'),
+        dropped: true,
+      })
     }
+  })
+
+  // ====== P0-3: 記錄分享 / 重玩事件 ======
+  socket.on('share_clicked', (payload: { turnId?: number; generationId?: string }) => {
+    const game = games.get(socket.id)
+    if (!game) return
+    logUsage({
+      session_id: socket.id,
+      anon_user_id: game.anonUserId,
+      turn_id: payload.turnId || 0,
+      generation_id: payload.generationId || '',
+      event_type: 'share_clicked',
+      timestamp: new Date().toISOString(),
+      share_clicked: true,
+    })
+  })
+
+  socket.on('replay_clicked', (payload: { turnId?: number; generationId?: string }) => {
+    const game = games.get(socket.id)
+    if (!game) return
+    logUsage({
+      session_id: socket.id,
+      anon_user_id: game.anonUserId,
+      turn_id: payload.turnId || 0,
+      generation_id: payload.generationId || '',
+      event_type: 'replay_clicked',
+      timestamp: new Date().toISOString(),
+      replay_clicked: true,
+    })
   })
 
   // 重置遊戲
   socket.on('reset_game', () => {
+    const oldGame = games.get(socket.id)
+    const anonUserId = oldGame?.anonUserId || UsageLogger.hashUserId(socket.id)
     games.set(socket.id, {
       messages: [{ role: 'assistant', content: SYSTEM_PROMPT }],
       turnCount: 0,
       ended: false,
       sessionId: socket.id,
+      currentGenerationId: '',
+      anonUserId,
     })
-    socket.emit('reset_ok', {})
+    socket.emit('reset_ok', { sessionId: socket.id })
     console.log(`[reset] ${socket.id}`)
   })
 

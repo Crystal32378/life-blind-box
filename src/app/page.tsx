@@ -93,6 +93,17 @@ export default function VoiceGamePage() {
   const [sceneTemplate, setSceneTemplate] = useState<SceneTemplateInfo | null>(null)
   const [categories, setCategories] = useState<CategoryInfo[]>([])
 
+  // ====== P0-1: generation tracking ======
+  // currentGenerationId：前端只接受符合這個 ID 的 text/audio chunk，舊的全部 discard
+  const currentGenerationIdRef = useRef<string>('')
+  const currentTurnIdRef = useRef<number>(0)
+  // 用 ref 而不是 state，避免 re-render race condition
+  const [serverQuota, setServerQuota] = useState<{
+    perIpRemaining: number
+    perIpLimit: number
+    betaDisabled: boolean
+  } | null>(null)
+
   // === Refs ===
   const socketRef = useRef<Socket | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -177,8 +188,20 @@ export default function VoiceGamePage() {
     }
   }, [muted])
 
-  // 收到 audio_chunk
-  const handleAudioChunk = useCallback((payload: { seq: number; audio: string; format: string }) => {
+  // 收到 audio_chunk — P0-1: 檢查 generationId，舊的 discard
+  const handleAudioChunk = useCallback((payload: {
+    sessionId?: string
+    turnId?: number
+    generationId?: string
+    seq: number
+    audio: string
+    format: string
+  }) => {
+    // 如果帶了 generationId 且不是當前 generation，直接 discard
+    if (payload.generationId && payload.generationId !== currentGenerationIdRef.current) {
+      console.debug(`[discard audio] gen ${payload.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
+      return
+    }
     audioQueueRef.current.set(payload.seq, payload.audio)
     tryPlayNext()
   }, [tryPlayNext])
@@ -219,51 +242,120 @@ export default function VoiceGamePage() {
       setConnected(true)
       socket.emit('list_categories')
     })
-    socket.on('disconnect', () => setConnected(false))
+    socket.on('disconnect', () => {
+      setConnected(false)
+      // P0-6: disconnect fallback — 顯示提示但不要清空遊戲狀態（讓 reconnect 後可恢復）
+      setError('連線中斷，正在嘗試重新連線...')
+    })
+    socket.on('reconnect', () => {
+      setError(null)
+    })
 
     socket.on('categories_list', (data: { categories: CategoryInfo[] }) => {
       setCategories(data.categories)
     })
 
-    socket.on('text_chunk', (data: { seq: number; text: string }) => {
+    // P0-1: 接收 connected 事件（含 quota 資訊）
+    socket.on('connected', (data: {
+      sessionId: string
+      anonUserId?: string
+      quota?: {
+        perIpRemaining: number
+        perIpLimit: number
+        betaDisabled: boolean
+        globalRemaining: number
+        globalLimit: number
+      }
+    }) => {
+      if (data.quota) {
+        setServerQuota({
+          perIpRemaining: data.quota.perIpRemaining,
+          perIpLimit: data.quota.perIpLimit,
+          betaDisabled: data.quota.betaDisabled,
+        })
+      }
+    })
+
+    // P0-1: text_chunk 帶 generationId，舊的 discard
+    socket.on('text_chunk', (data: {
+      sessionId?: string
+      turnId?: number
+      generationId?: string
+      seq: number
+      text: string
+    }) => {
+      if (data.generationId && data.generationId !== currentGenerationIdRef.current) {
+        console.debug(`[discard text] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
+        return
+      }
       setSubtitles(prev => [...prev, { seq: data.seq, text: data.text, role: 'narrator' }])
       setNarrationText(prev => prev + (prev ? '' : '') + data.text)
     })
 
     socket.on('audio_chunk', handleAudioChunk)
 
-    socket.on('user_text', (data: { text: string }) => {
+    socket.on('user_text', (data: { text: string; generationId?: string }) => {
+      // user_text 不需要 generation filter（玩家自己的話永遠顯示）
       setSubtitles(prev => [...prev, { seq: Date.now(), text: data.text, role: 'user' }])
     })
 
-    socket.on('turn_start', (data: { turn: number }) => {
+    // P0-1: turn_start 帶 generationId，更新 currentGenerationId
+    socket.on('turn_start', (data: {
+      sessionId?: string
+      turnId?: number
+      generationId?: string
+      turn: number
+    }) => {
+      if (data.generationId) {
+        currentGenerationIdRef.current = data.generationId
+        console.debug(`[turn_start] new gen=${data.generationId.slice(0,8)}`)
+      }
+      if (typeof data.turnId === 'number') currentTurnIdRef.current = data.turnId
       setTurn(data.turn)
       setNarrationText('')
     })
 
-    socket.on('scene_template', (data: SceneTemplateInfo) => {
+    socket.on('scene_template', (data: SceneTemplateInfo & { generationId?: string }) => {
       setSceneTemplate(data)
     })
 
-    socket.on('turn_complete', (data: { turn: number; isEnding: boolean }) => {
+    // P0-1: turn_complete 帶 generationId，舊的 discard
+    socket.on('turn_complete', (data: {
+      sessionId?: string
+      turnId?: number
+      generationId?: string
+      turn: number
+      isEnding: boolean
+    }) => {
+      if (data.generationId && data.generationId !== currentGenerationIdRef.current) {
+        console.debug(`[discard turn_complete] gen ${data.generationId.slice(0,8)}`)
+        return
+      }
       if (typeof data.turn === 'number') setTurn(data.turn)
       setPhaseSafe('idle')
     })
 
-    socket.on('game_over', (data: { ending?: string; meta?: EndingMeta }) => {
+    socket.on('game_over', (data: {
+      sessionId?: string
+      turnId?: number
+      generationId?: string
+      ending?: string
+      meta?: EndingMeta
+    }) => {
       if (data?.meta) {
         setEndingMeta(data.meta)
       }
       setPhaseSafe('ended')
     })
 
-    socket.on('status', (data: { stage: string }) => {
+    socket.on('status', (data: { stage: string; generationId?: string }) => {
+      if (data.generationId && data.generationId !== currentGenerationIdRef.current) return
       if (data.stage === 'transcribing') {
         setPhaseSafe('transcribing')
       }
     })
 
-    socket.on('error_msg', (data: { message: string }) => {
+    socket.on('error_msg', (data: { message: string; code?: string }) => {
       setError(data.message)
       setPhaseSafe('idle')
     })
@@ -273,6 +365,9 @@ export default function VoiceGamePage() {
       setTurn(0)
       setNarrationText('')
       setEndingMeta(null)
+      setSceneTemplate(null)
+      currentGenerationIdRef.current = ''
+      currentTurnIdRef.current = 0
       setPhaseSafe('idle')
       setError(null)
       interruptPlayback()
@@ -434,15 +529,25 @@ AI 判詞：${endingMeta.verdict}
 https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
   }, [endingMeta, subtitles, sceneTemplate])
 
+  // P0-3: emit share_clicked event for usage logging
+  const emitShareClicked = useCallback(() => {
+    socketRef.current?.emit('share_clicked', {
+      turnId: currentTurnIdRef.current,
+      generationId: currentGenerationIdRef.current,
+    })
+  }, [])
+
   const handleShareTwitter = useCallback(() => {
     const text = buildShareText()
     if (!text) return
+    emitShareClicked()
     window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}`, '_blank')
-  }, [buildShareText])
+  }, [buildShareText, emitShareClicked])
 
   const handleShareCopy = useCallback(async () => {
     const text = buildShareText()
     if (!text) return
+    emitShareClicked()
     try {
       await navigator.clipboard.writeText(text)
       setCopied(true)
@@ -458,11 +563,12 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     }
-  }, [buildShareText])
+  }, [buildShareText, emitShareClicked])
 
   const handleShareNative = useCallback(async () => {
     const text = buildShareText()
     if (!text) return
+    emitShareClicked()
     if (navigator.share) {
       try {
         await navigator.share({ title: '人生盲盒', text })
@@ -472,7 +578,7 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
     } else {
       handleShareCopy()
     }
-  }, [buildShareText, handleShareCopy])
+  }, [buildShareText, handleShareCopy, emitShareClicked])
 
   // ============ Render ============
   const canRecord = connected && (phase === 'idle' || phase === 'narrating' || phase === 'transcribing') && phase !== 'ended'
@@ -779,6 +885,10 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
             {remainingToday > 0 ? (
               <button
                 onClick={() => {
+                  socketRef.current?.emit('replay_clicked', {
+                    turnId: currentTurnIdRef.current,
+                    generationId: currentGenerationIdRef.current,
+                  })
                   resetGame()
                   setTimeout(() => startGame(), 300)
                 }}
