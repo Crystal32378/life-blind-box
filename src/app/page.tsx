@@ -140,6 +140,9 @@ export default function VoiceGamePage() {
   const streamRef = useRef<MediaStream | null>(null)
   // 用來中斷正在 await 的 audio 播放 promise
   const interruptResolverRef = useRef<(() => void) | null>(null)
+  // P0-postgame-fix: flag to discard late audio_chunk after game_over
+  // Set true on game_over, reset false on start_game / generation_start
+  const gameEndedRef = useRef<boolean>(false)
 
   // Helper: update both phase state and ref
   const setPhaseSafe = useCallback((p: Phase) => {
@@ -210,6 +213,7 @@ export default function VoiceGamePage() {
   }, [muted])
 
   // 收到 audio_chunk — P0-1: 檢查 generationId，舊的 discard
+  // P0-postgame-fix: also discard if game has ended (late TTS promises still emitting)
   const handleAudioChunk = useCallback((payload: {
     sessionId?: string
     turnId?: number
@@ -218,6 +222,11 @@ export default function VoiceGamePage() {
     audio: string
     format: string
   }) => {
+    // P0-postgame-fix: game already ended, discard late audio
+    if (gameEndedRef.current) {
+      console.debug(`[discard audio] game ended, ignoring seq=${payload.seq}`)
+      return
+    }
     // 如果帶了 generationId 且不是當前 generation，直接 discard
     if (payload.generationId && payload.generationId !== currentGenerationIdRef.current) {
       console.debug(`[discard audio] gen ${payload.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
@@ -359,6 +368,8 @@ export default function VoiceGamePage() {
       // Reset audio playback state BEFORE updating generationId,
       // so any in-flight audio_chunk from old generation is cleanly discarded
       interruptPlayback()
+      // P0-postgame-fix: new generation means game is in progress, clear ended flag
+      gameEndedRef.current = false
       currentGenerationIdRef.current = data.generationId
       if (typeof data.turnId === 'number') currentTurnIdRef.current = data.turnId
     })
@@ -417,6 +428,11 @@ export default function VoiceGamePage() {
         console.debug(`[discard game_over] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
         return
       }
+      // P0-postgame-fix: mark game ended + stop any in-flight audio
+      // Late audio_chunk from server's pending TTS promises will be discarded by handleAudioChunk
+      gameEndedRef.current = true
+      interruptPlayback()
+      console.log(`[game_over] ending=${data.ending || 'auto'}, audio queue cleared, late audio will be discarded`)
       if (data?.meta) {
         setEndingMeta(data.meta)
       }
@@ -606,6 +622,8 @@ export default function VoiceGamePage() {
     setTurn(0)
     interruptPlayback()
     nextPlaySeqRef.current = 0
+    // P0-postgame-fix: new game starting, clear ended flag so audio plays normally
+    gameEndedRef.current = false
     setPhaseSafe('narrating')
     // 開局時 increment
     const newCount = incrementDailyCount()
