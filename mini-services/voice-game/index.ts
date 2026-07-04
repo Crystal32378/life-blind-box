@@ -408,11 +408,13 @@ async function streamNarration(
   onLLMDone?: () => void,
   ids?: { sessionId: string; turnId: number; generationId: string; anonUserId?: string },
   onFirstTextChunk?: () => void,  // P0-0: fires when first text_chunk is emitted (for quota charge decision)
+  suppressEnding?: boolean,  // hard-gated C: if true, treat [[END]]/META: as normal text, don't enter ending block
 ): Promise<{ fullText: string; isEnding: boolean; meta?: EndingMeta }> {
   const sessionId = ids?.sessionId || ''
   const turnId = ids?.turnId ?? 0
   const generationId = ids?.generationId || ''
   const anonUserId = ids?.anonUserId || ''
+  const shouldSuppressEnding = suppressEnding === true  // hard-gated C
 
   let buffer = ''
   let fullText = ''
@@ -568,7 +570,9 @@ async function streamNarration(
 
       // P0-ending-fix: check if we just entered the ending block ([[END]] or META:)
       // Once entered, stop flushing sentences as text/TTS — buffer everything for final parse
-      if (!endingBlockStarted && isEnteringEndingBlock(fullText)) {
+      // hard-gated C: if shouldSuppressEnding (turn < 5/5), DON'T enter ending block
+      // — strip [[END]]/META: from buffer and continue normal flushing
+      if (!shouldSuppressEnding && !endingBlockStarted && isEnteringEndingBlock(fullText)) {
         endingBlockStarted = true
         console.log(`[ending-buffer] entering ending block, suppressing further text/TTS emit`)
         // Flush any pre-ending text that's still in buffer (劇情文字 before [[END]])
@@ -582,6 +586,20 @@ async function streamNarration(
         }
         buffer = ''  // clear buffer, don't flush ending markers as text
         return
+      }
+
+      // hard-gated C: if shouldSuppressEnding, strip [[END]]/META: from buffer so they
+      // don't leak as text/TTS, but continue normal sentence flushing for 劇情文字
+      if (shouldSuppressEnding) {
+        // Remove [[END]] and META:... from buffer
+        const cleanedBuffer = buffer
+          .replace(/\[\[END\]\]/g, '')
+          .replace(/META:\s*\{[\s\S]*$/g, '')
+          .replace(/META:\s*\{[^}]*\}/g, '')
+        if (cleanedBuffer !== buffer) {
+          console.debug(`[ending-suppress-stream] stripped ending markers from buffer`)
+          buffer = cleanedBuffer
+        }
       }
 
       // If already in ending block, just accumulate fullText, don't flush
@@ -604,12 +622,15 @@ async function streamNarration(
 
   // 收尾：剩下的 buffer 也送 TTS
   // P0-ending-fix: if in ending block, don't flush buffer (it's ending markers/META)
+  // hard-gated C: if shouldSuppressEnding, buffer has already been stripped of ending markers,
+  // so safe to flush remaining 劇情文字
   if (!endingBlockStarted && buffer.trim()) {
     flushSentence(buffer)
   }
 
   // P0-ending-fix: if we entered ending block, parse the full text for ending/meta
-  if (endingBlockStarted) {
+  // hard-gated C: if shouldSuppressEnding, we never entered ending block, so isEnding stays false
+  if (endingBlockStarted && !shouldSuppressEnding) {
     const { isEnding: detectedEnding, meta: detectedMeta } = detectEnding(fullText)
     if (detectedEnding) {
       isEnding = true
@@ -621,6 +642,13 @@ async function streamNarration(
       endingMeta = FALLBACK_ENDING_META
       console.warn(`[ending-buffer] ending block started but detectEnding didn't confirm, using fallback`)
     }
+  }
+
+  // hard-gated C: if shouldSuppressEnding, ensure isEnding=false (game continues to next turn)
+  if (shouldSuppressEnding && isEnding) {
+    console.warn(`[ending-suppress] LLM output ending but shouldSuppressEnding=true, forcing isEnding=false`)
+    isEnding = false
+    endingMeta = undefined
   }
 
   // LLM 結束，立刻通知（不等 TTS），讓前端可以早點切回 idle / 允許玩家搶話
@@ -972,23 +1000,27 @@ io.on('connection', (socket) => {
       // 2. 加入對話歷史
       game.messages.push({ role: 'user', content: userText })
 
-      // 3. 提示 LLM 該收尾了
-      if (nextTurn >= MAX_TURNS - 1 && nextTurn < MAX_TURNS) {
+      // 3. 提示 LLM 該收尾了（hard-gated C: 漸進式收尾）
+      // turn 4/5 (nextTurn === MAX_TURNS - 1): 鋪陳收尾，但禁止 [[END]] / META:
+      // turn 5/5 (nextTurn >= MAX_TURNS): 必須結束，必須輸出 [[END]] + META:
+      if (nextTurn === MAX_TURNS - 1) {
         game.messages.push({
           role: 'assistant',
-          content: '（系統提示：這是最後一輪了，請給出一個明確的結局。結尾必須是 [[END]] 加上 META JSON，格式如：[[END]]\\nMETA:{"title":"劇名","endingType":"好結局/壞結局/懸念結局","verdict":"AI 判詞"}）',
+          content: '（系統提示：劇情接近尾聲，這一輪可以開始鋪陳收束、埋下最後的反轉或伏筆，把故事推向結局邊緣。但是——這一輪「不可以」結束故事。嚴格禁止：不要輸出 [[END]]、不要輸出 META:、不要給出結局。讓玩家進入下一輪才會迎來真正的結局。）',
         })
       } else if (nextTurn >= MAX_TURNS) {
         game.messages.push({
           role: 'assistant',
-          content: '（系統提示：已達到 5 輪上限，必須立即結束故事，給出結局。結尾必須是 [[END]] 加上 META JSON，格式如：[[END]]\\nMETA:{"title":"劇名","endingType":"好結局/壞結局/懸念結局","verdict":"AI 判詞"}）',
+          content: '（系統提示：這是最後一輪，必須立即結束故事。結尾必須是 [[END]] 加上 META JSON，格式如：[[END]]\\nMETA:{"title":"劇名","endingType":"好結局/壞結局/懸念結局","verdict":"AI 判詞"}。如果沒有輸出 [[END]]，系統會強制結束。）',
         })
       }
 
       socket.emit('turn_start', { sessionId: socket.id, turnId: nextTurn, generationId, turn: nextTurn })
 
       // 4. 串流 LLM + TTS
-      const allowEnding = nextTurn >= 4
+      // hard-gated C: 只在 turn 5/5 (nextTurn >= MAX_TURNS) 才允許真正 ending
+      // turn 4/5 即使 LLM 偷輸出 [[END]]/META:，也會被 suppress，遊戲繼續
+      const allowEnding = nextTurn >= MAX_TURNS
       let detectedEnding = false
       let endingMeta: EndingMeta | undefined
       const turnStart = Date.now()
@@ -996,20 +1028,46 @@ io.on('connection', (socket) => {
         socket,
         game.messages,
         (text, ending, meta) => {
-          const cleanText = allowEnding ? text : text.replace(/\[\[END\]\]/g, '').trim()
-          game.messages.push({ role: 'assistant', content: cleanText })
-          game.turnCount = nextTurn
-          if (allowEnding && ending) {
-            detectedEnding = true
-            game.ended = true
-            if (meta) endingMeta = meta
+          // hard-gated C: if not allowEnding (turn < 5/5), suppress ALL ending markers
+          // — strip [[END]] and META: from text, ignore ending signal, game continues
+          if (allowEnding) {
+            const cleanText = text.replace(/\[\[END\]\]/g, '').trim()
+            game.messages.push({ role: 'assistant', content: cleanText })
+            game.turnCount = nextTurn
+            if (ending) {
+              detectedEnding = true
+              game.ended = true
+              if (meta) endingMeta = meta
+            }
+          } else {
+            // turn 4/5 or earlier: LLM might have output [[END]]/META: despite instructions
+            // — strip them from text so they don't leak, but DON'T set game.ended
+            const suppressedText = text
+              .replace(/\[\[END\]\]/g, '')
+              .replace(/META:\s*\{[\s\S]*$/,'')
+              .replace(/META:\s*\{[^}]*\}/g, '')
+              .trim()
+            if (suppressedText) {
+              game.messages.push({ role: 'assistant', content: suppressedText })
+            } else {
+              // LLM 只輸出了 ending markers，没劇情文字 → push 原始 text（已經被 streamNarration 清過）
+              game.messages.push({ role: 'assistant', content: text.replace(/\[\[END\]\]/g, '').replace(/META:[\s\S]*$/,'').trim() })
+            }
+            game.turnCount = nextTurn
+            // detectedEnding stays false — game continues to next turn
+            if (ending) {
+              console.warn(`[ending-suppress] LLM output ending on turn ${nextTurn} (allowEnding=false), suppressed, game continues`)
+            }
           }
         },
         undefined,
         undefined,
         { sessionId: socket.id, turnId: nextTurn, generationId, anonUserId: game.anonUserId },
+        undefined,  // onFirstTextChunk (not used in submit_audio turn)
+        !allowEnding,  // hard-gated C: suppressEnding = true when allowEnding is false (turn < 5/5)
       )
 
+      // hard-gated C: finalEnding only true if allowEnding AND ending detected
       const finalEnding = allowEnding ? (isEnding || detectedEnding) : false
 
       // P0-ending-fix: force ending on max turn even if LLM didn't output [[END]]
