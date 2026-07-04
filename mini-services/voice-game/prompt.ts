@@ -86,27 +86,124 @@ export interface EndingMeta {
   verdict: string
 }
 
-export function detectEnding(text: string): { content: string; isEnding: boolean; meta?: EndingMeta } {
-  if (text.includes('[[END]]')) {
-    let meta: EndingMeta | undefined
-    let content = text
-
-    // 嘗試解析 META JSON
-    const metaMatch = text.match(/META:\s*(\{[^}]+\})/s)
-    if (metaMatch) {
-      try {
-        meta = JSON.parse(metaMatch[1])
-        // 移除 META 部分
-        content = text.replace(/\[\[END\]\][\s\S]*$/, '').trim()
-      } catch {
-        // JSON 解析失敗，還是當結局但沒 meta
-        content = text.replace(/\[\[END\]\][\s\S]*$/, '').trim()
-      }
-    } else {
-      content = text.replace(/\[\[END\]\]/g, '').trim()
-    }
-
-    return { content, isEnding: true, meta }
-  }
-  return { content: text, isEnding: false }
+// P0-ending-fix: fallback ending meta when LLM output is malformed or missing
+const FALLBACK_ENDING_META: EndingMeta = {
+  title: '未完的篇章',
+  endingType: '懸念結局',
+  verdict: '故事在這裡斷了線，留給想像',
 }
+
+/**
+ * 嘗試從 text 裡 parse 出 META JSON。
+ * 支援：
+ *   - META:{...} 單行
+ *   - META:\n{...} 多行（LLM 有時會換行）
+ *   - JSON 裡有 } 不會被正則提前斷掉（用 [\s\S] 而非 [^}]）
+ * 回傳 { meta, rawMetaText } — parse 失敗時 meta=undefined, rawMetaText 是原始 META 區段
+ */
+function parseMetaFromText(text: string): { meta?: EndingMeta; rawMetaText: string } {
+  // META: 之後到字串結尾（或下一個非 JSON 字元）
+  const metaStart = text.indexOf('META:')
+  if (metaStart === -1) return { rawMetaText: '' }
+
+  const afterMeta = text.slice(metaStart + 5).trim()
+  // 找第一個 { 開始
+  const braceStart = afterMeta.indexOf('{')
+  if (braceStart === -1) return { rawMetaText: text.slice(metaStart) }
+
+  // 從 { 開始，找配對的 }（處理巢狀）
+  let depth = 0
+  let braceEnd = -1
+  for (let i = braceStart; i < afterMeta.length; i++) {
+    if (afterMeta[i] === '{') depth++
+    else if (afterMeta[i] === '}') {
+      depth--
+      if (depth === 0) { braceEnd = i; break }
+    }
+  }
+
+  if (braceEnd === -1) {
+    // JSON 還不完整（streaming 中）——回傳 rawMetaText 但不 parse
+    return { rawMetaText: text.slice(metaStart) }
+  }
+
+  const jsonStr = afterMeta.slice(braceStart, braceEnd + 1)
+  try {
+    const parsed = JSON.parse(jsonStr)
+    // 驗證必要欄位
+    if (parsed && typeof parsed.title === 'string' && typeof parsed.endingType === 'string' && typeof parsed.verdict === 'string') {
+      return { meta: parsed, rawMetaText: text.slice(metaStart) }
+    }
+    return { rawMetaText: text.slice(metaStart) }  // 欄位不齊
+  } catch {
+    return { rawMetaText: text.slice(metaStart) }  // JSON parse 失敗
+  }
+}
+
+/**
+ * P0-ending-fix: 偵測結局標記 + META
+ * - 偵測 [[END]] 或 META: 出現 → isEnding=true
+ * - parse META JSON（支援多行、巢狀 }）
+ * - parse 失敗 → 回傳 fallback meta
+ * - content 移除 [[END]] 和 META 區段，只留劇情文字
+ */
+export function detectEnding(text: string): { content: string; isEnding: boolean; meta?: EndingMeta } {
+  const hasEndMarker = text.includes('[[END]]')
+  const hasMetaMarker = text.includes('META:')
+
+  if (!hasEndMarker && !hasMetaMarker) {
+    return { content: text, isEnding: false }
+  }
+
+  // 偵測到 ending 信號
+  let content = text
+  let meta: EndingMeta | undefined
+
+  if (hasMetaMarker) {
+    const { meta: parsedMeta, rawMetaText } = parseMetaFromText(text)
+    meta = parsedMeta  // undefined if parse failed
+    // 從 text 移除 META 區段（從 META: 開始到結尾）
+    const metaStart = text.indexOf('META:')
+    content = text.slice(0, metaStart)
+  }
+
+  // 從 content 移除 [[END]]
+  if (hasEndMarker) {
+    content = content.replace(/\[\[END\]\]/g, '')
+  }
+
+  content = content.trim()
+
+  // 如果 parse 失敗，用 fallback meta（但只在我們真的看到 META: 時）
+  if (hasMetaMarker && !meta) {
+    meta = FALLBACK_ENDING_META
+    console.warn('[detectEnding] META parse failed, using fallback')
+  }
+
+  return { content, isEnding: true, meta }
+}
+
+/**
+ * P0-ending-fix: 檢查 text 是否「開始」進入 ending 區段
+ * 用於 streaming 時決定要不要停止 emit text_chunk / audio_chunk
+ * 一旦看到 [[END]] 或 META: 的開頭，就進入 metadata buffering 模式
+ */
+export function isEnteringEndingBlock(text: string): boolean {
+  return text.includes('[[END]]') || text.includes('META:')
+}
+
+/**
+ * P0-ending-fix: 從完整 text 抽出 ending 前的劇情文字（不含 [[END]] / META）
+ * 用於 streaming 收尾時，把最後一段「還沒 flush 但已經是 ending 一部分」的文字清掉
+ */
+export function extractPreEndingText(text: string): string {
+  const endIdx = text.indexOf('[[END]]')
+  const metaIdx = text.indexOf('META:')
+  let cutIdx = -1
+  if (endIdx !== -1) cutIdx = endIdx
+  if (metaIdx !== -1 && (cutIdx === -1 || metaIdx < cutIdx)) cutIdx = metaIdx
+  if (cutIdx === -1) return text
+  return text.slice(0, cutIdx).trim()
+}
+
+export { FALLBACK_ENDING_META }

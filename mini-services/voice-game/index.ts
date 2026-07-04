@@ -2,7 +2,7 @@ import { createServer } from 'http'
 import { Server } from 'socket.io'
 import { randomUUID } from 'crypto'
 import { openai, getZAI, LLM_MODEL, TTS_VOICE } from './openai-client'
-import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
+import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, isEnteringEndingBlock, extractPreEndingText, FALLBACK_ENDING_META, EndingMeta } from './prompt'
 import { pickRandomTemplate, pickTemplateByCategory, templateToOpeningPrompt, SceneTemplate, CATEGORY_NAMES, SceneCategory, SCENE_TEMPLATES } from './scene-templates'
 import { usageLogger, logUsage, UsageLogger } from './usage-logger'
 import { QuotaChecker, UserMode } from './quota'
@@ -421,6 +421,10 @@ async function streamNarration(
   let endingMeta: EndingMeta | undefined
   let retryCount = 0
 
+  // P0-ending-fix: once we see [[END]] or META: in fullText, enter metadata buffering mode
+  // — stop emitting text_chunk / audio_chunk, just accumulate fullText for final parse
+  let endingBlockStarted = false
+
   // 並行 TTS：每個 sentence 起一個 Promise，完成後 emit。
   const ttsPromises: Promise<void>[] = []
 
@@ -432,6 +436,13 @@ async function streamNarration(
   const flushSentence = (sentence: string) => {
     const trimmed = sentence.trim()
     if (!trimmed) return
+
+    // P0-ending-fix: if we've entered ending block, don't emit this sentence as text/TTS
+    // (it's either META JSON or ending marker text — should not be shown or spoken)
+    if (endingBlockStarted) {
+      console.debug(`[ending-buffer] suppressing sentence in ending block: "${trimmed.slice(0, 40)}..."`)
+      return
+    }
 
     const { content, isEnding: ending, meta } = detectEnding(trimmed)
     if (ending) {
@@ -554,6 +565,30 @@ async function streamNarration(
       if (!llmFirstTokenMs) llmFirstTokenMs = Date.now() - turnStart
       buffer += delta
       fullText += delta
+
+      // P0-ending-fix: check if we just entered the ending block ([[END]] or META:)
+      // Once entered, stop flushing sentences as text/TTS — buffer everything for final parse
+      if (!endingBlockStarted && isEnteringEndingBlock(fullText)) {
+        endingBlockStarted = true
+        console.log(`[ending-buffer] entering ending block, suppressing further text/TTS emit`)
+        // Flush any pre-ending text that's still in buffer (劇情文字 before [[END]])
+        const preEnding = extractPreEndingText(buffer)
+        if (preEnding.trim()) {
+          // Re-split the pre-ending part and flush those sentences
+          const preSentences = splitIntoSentences(preEnding)
+          for (const s of preSentences) {
+            flushSentence(s)
+          }
+        }
+        buffer = ''  // clear buffer, don't flush ending markers as text
+        return
+      }
+
+      // If already in ending block, just accumulate fullText, don't flush
+      if (endingBlockStarted) {
+        return
+      }
+
       // 嘗試切出完整句
       const sentences = splitIntoSentences(buffer)
       if (sentences.length > 1) {
@@ -568,8 +603,24 @@ async function streamNarration(
   )
 
   // 收尾：剩下的 buffer 也送 TTS
-  if (buffer.trim()) {
+  // P0-ending-fix: if in ending block, don't flush buffer (it's ending markers/META)
+  if (!endingBlockStarted && buffer.trim()) {
     flushSentence(buffer)
+  }
+
+  // P0-ending-fix: if we entered ending block, parse the full text for ending/meta
+  if (endingBlockStarted) {
+    const { isEnding: detectedEnding, meta: detectedMeta } = detectEnding(fullText)
+    if (detectedEnding) {
+      isEnding = true
+      endingMeta = detectedMeta || FALLBACK_ENDING_META
+      console.log(`[ending-buffer] final parse: isEnding=true, meta title="${endingMeta?.title}"`)
+    } else {
+      // Saw [[END]] or META: but detectEnding didn't confirm? Use fallback.
+      isEnding = true
+      endingMeta = FALLBACK_ENDING_META
+      console.warn(`[ending-buffer] ending block started but detectEnding didn't confirm, using fallback`)
+    }
   }
 
   // LLM 結束，立刻通知（不等 TTS），讓前端可以早點切回 idle / 允許玩家搶話
@@ -961,12 +1012,26 @@ io.on('connection', (socket) => {
 
       const finalEnding = allowEnding ? (isEnding || detectedEnding) : false
 
+      // P0-ending-fix: force ending on max turn even if LLM didn't output [[END]]
+      // This prevents games from running past turn 5 without an ending card
+      let forcedEndingMeta: EndingMeta | undefined
+      let wasForcedEnding = false
+      if (allowEnding && !finalEnding && nextTurn >= MAX_TURNS) {
+        console.warn(`[ending-force] max turn ${nextTurn} reached without ending, forcing fallback`)
+        wasForcedEnding = true
+        forcedEndingMeta = FALLBACK_ENDING_META
+        game.ended = true
+      }
+
+      const effectiveEnding = finalEnding || wasForcedEnding
+      const effectiveMeta = endingMeta || forcedEndingMeta
+
       socket.emit('turn_complete', {
         sessionId: socket.id,
         turnId: nextTurn,
         generationId,
         turn: game.turnCount,
-        isEnding: finalEnding,
+        isEnding: effectiveEnding,
       })
 
       logUsage({
@@ -977,18 +1042,18 @@ io.on('connection', (socket) => {
         event_type: 'turn_complete',
         timestamp: new Date().toISOString(),
         completed: true,
-        ending_type: finalEnding ? endingMeta?.endingType : undefined,
-        extra: { turn_total_ms: Date.now() - turnStart, allow_ending: allowEnding },
+        ending_type: effectiveEnding ? effectiveMeta?.endingType : undefined,
+        extra: { turn_total_ms: Date.now() - turnStart, allow_ending: allowEnding, forced_ending: wasForcedEnding },
         user_mode: game.userMode,
       })
 
-      if (finalEnding) {
+      if (effectiveEnding) {
         socket.emit('game_over', {
           sessionId: socket.id,
           turnId: nextTurn,
           generationId,
-          ending: 'auto',
-          meta: endingMeta,
+          ending: wasForcedEnding ? 'forced' : 'auto',
+          meta: effectiveMeta,
         })
         logUsage({
           session_id: socket.id,
@@ -998,8 +1063,8 @@ io.on('connection', (socket) => {
           event_type: 'game_over',
           timestamp: new Date().toISOString(),
           completed: true,
-          ending_type: endingMeta?.endingType,
-          extra: endingMeta ? { title: endingMeta.title, verdict: endingMeta.verdict } : {},
+          ending_type: effectiveMeta?.endingType,
+          extra: effectiveMeta ? { title: effectiveMeta.title, verdict: effectiveMeta.verdict, forced: wasForcedEnding } : {},
           user_mode: game.userMode,
         })
       }
