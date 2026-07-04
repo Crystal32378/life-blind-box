@@ -5,10 +5,11 @@ import { openai, getZAI, LLM_MODEL, TTS_VOICE } from './openai-client'
 import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
 import { pickRandomTemplate, pickTemplateByCategory, templateToOpeningPrompt, SceneTemplate, CATEGORY_NAMES, SceneCategory, SCENE_TEMPLATES } from './scene-templates'
 import { usageLogger, logUsage, UsageLogger } from './usage-logger'
-import { QuotaChecker } from './quota'
+import { QuotaChecker, UserMode } from './quota'
 import { checkContentSafety, checkLLMOutput, checkUserInput, SAFETY_FALLBACK_NARRATION } from './safety'
 import { TTSCircuitBreaker } from './tts-circuit-breaker'
 import { textToSpeechOpenAI, isOpenAIConfigured } from './openai-tts'
+import { streamLLMViaOpenAI, isOpenAILLMConfigured } from './openai-llm'
 
 // ====== Types ======
 interface GameState {
@@ -19,6 +20,8 @@ interface GameState {
   template?: SceneTemplate  // 這一局抽到的場景模板
   currentGenerationId: string  // 當前有效的 generation（用來 discard 舊事件）
   anonUserId: string  // 匿名用戶 ID（IP hash）
+  founderToken?: string  // P0-3: founder token (never logged, never sent to frontend)
+  userMode: UserMode  // P0-3: 'founder' | 'public'
 }
 
 interface PendingTTS {
@@ -31,6 +34,17 @@ const PORT = 3003
 const MAX_TURNS = 5
 const games = new Map<string, GameState>() // socket.id -> game state
 
+// P0-1: narrative error copy (no technical jargon, per 大G)
+const NARRATIVE_ERRORS = [
+  '這段人生剛剛沒有聽清楚，請再說一次。',
+  '命運線路短暫打結，請重新敲門。',
+  '訊號在時空裂縫中迷路了，再試一次吧。',
+  '這段對話被風吹散了，請重說一次。',
+]
+function pickNarrativeError(): string {
+  return NARRATIVE_ERRORS[Math.floor(Math.random() * NARRATIVE_ERRORS.length)]
+}
+
 // ====== HTTP + Socket.io server ======
 const httpServer = createServer((req, res) => {
   // P1: monitor endpoint for circuit breaker status
@@ -41,7 +55,9 @@ const httpServer = createServer((req, res) => {
       ok: true,
       tts_provider: TTS_PROVIDER,
       openai_configured: isOpenAIConfigured(),
+      openai_llm_configured: isOpenAILLMConfigured(),
       circuit_breaker: breakerStatus,
+      founder_mode_enabled: QuotaChecker.isFounderModeEnabled(),
       uptime_ms: Date.now() - startTime,
     }))
     return
@@ -154,28 +170,44 @@ async function streamLLM(
   const t0 = Date.now()
   console.log(`[LLM] starting stream, model=${LLM_MODEL}, messages=${messages.length}`)
 
-  // z.ai gateway 接受原本的 messages 格式（role: 'assistant' for system prompt 也 OK）
-  const stream = await openai.chat.completions.create({
-    model: LLM_MODEL,
-    messages: messages as any,
-    stream: true,
-    temperature: 0.9,
-  }, { signal: abortSignal })
-  console.log(`[LLM] stream returned after ${Date.now() - t0}ms`)
+  try {
+    // Primary: z.ai gateway
+    const stream = await openai.chat.completions.create({
+      model: LLM_MODEL,
+      messages: messages as any,
+      stream: true,
+      temperature: 0.9,
+    }, { signal: abortSignal })
+    console.log(`[LLM] stream returned after ${Date.now() - t0}ms`)
 
-  let chunkCount = 0
-  for await (const part of stream) {
-    if (abortSignal?.aborted) break
-    chunkCount++
-    const delta = part?.choices?.[0]?.delta?.content || ''
-    if (delta) {
-      fullText += delta
-      onText(delta)
+    let chunkCount = 0
+    for await (const part of stream) {
+      if (abortSignal?.aborted) break
+      chunkCount++
+      const delta = part?.choices?.[0]?.delta?.content || ''
+      if (delta) {
+        fullText += delta
+        onText(delta)
+      }
     }
+    console.log(`[LLM] stream ended after ${Date.now() - t0}ms, chunks=${chunkCount}, textLen=${fullText.length}`)
+    return fullText
+  } catch (err: any) {
+    // P1: LLM fallback to OpenAI (implemented, not env-verified — sandbox 403)
+    const msg = String(err?.message || err)
+    const is429 = msg.includes('429') || msg.includes('Too many requests')
+    if (is429 && isOpenAILLMConfigured()) {
+      console.warn(`[LLM] z.ai 429, falling back to OpenAI: ${msg.slice(0, 100)}`)
+      try {
+        fullText = await streamLLMViaOpenAI(messages, onText, abortSignal)
+        console.log(`[LLM] OpenAI fallback succeeded, textLen=${fullText.length}`)
+        return fullText
+      } catch (openaiErr: any) {
+        console.error(`[LLM] OpenAI fallback also failed:`, String(openaiErr?.message || openaiErr).slice(0, 100))
+      }
+    }
+    throw err
   }
-  console.log(`[LLM] stream ended after ${Date.now() - t0}ms, chunks=${chunkCount}, textLen=${fullText.length}`)
-
-  return fullText
 }
 
 // ====== TTS provider config ======
@@ -375,6 +407,7 @@ async function streamNarration(
   abortSignal?: AbortSignal,
   onLLMDone?: () => void,
   ids?: { sessionId: string; turnId: number; generationId: string; anonUserId?: string },
+  onFirstTextChunk?: () => void,  // P0-0: fires when first text_chunk is emitted (for quota charge decision)
 ): Promise<{ fullText: string; isEnding: boolean; meta?: EndingMeta }> {
   const sessionId = ids?.sessionId || ''
   const turnId = ids?.turnId ?? 0
@@ -436,6 +469,8 @@ async function streamNarration(
       seq: currentSeq,
       text: finalSentence,
     })
+    // P0-0: notify caller that at least one playable response was sent
+    onFirstTextChunk?.()
 
     // 並行發起 TTS，但 semaphore 限制並行 + 節流
     const p = (async () => {
@@ -573,6 +608,10 @@ io.on('connection', (socket) => {
   const rawIp = (socket.handshake as any)?.address || socket.id
   const anonUserId = UsageLogger.hashUserId(rawIp)
 
+  // P0-3: parse founder token from handshake auth (not from query string — avoid URL logging)
+  const founderToken = (socket.handshake as any)?.auth?.founderToken as string | undefined
+  const userMode: UserMode = QuotaChecker.isFounderTokenValid(founderToken) ? 'founder' : 'public'
+
   games.set(socket.id, {
     messages: [{ role: 'assistant', content: SYSTEM_PROMPT }],
     turnCount: 0,
@@ -580,14 +619,19 @@ io.on('connection', (socket) => {
     sessionId: socket.id,
     currentGenerationId: '',
     anonUserId,
+    founderToken: userMode === 'founder' ? founderToken : undefined,
+    userMode,
   })
 
-  // 連線成功 → 送 sessionId + 額度狀態
-  const quotaStatus = QuotaChecker.getStatus(anonUserId)
+  console.log(`[connect] ${socket.id} mode=${userMode}`)
+
+  // 連線成功 → 送 sessionId + 額度狀態 + userMode (P0-3)
+  const quotaStatus = QuotaChecker.getStatus(anonUserId, founderToken)
   socket.emit('connected', {
     sessionId: socket.id,
     anonUserId,
     quota: quotaStatus,
+    userMode,
   })
 
   // 列出所有可用類別（給前端顯示用）
@@ -610,10 +654,10 @@ io.on('connection', (socket) => {
       return
     }
 
-    // ====== P0-2: server-side quota check ======
-    const quotaCheck = QuotaChecker.checkCanStart(game.anonUserId)
+    // ====== P0-2: server-side quota check (P0-3: pass founderToken) ======
+    const quotaCheck = QuotaChecker.checkCanStart(game.anonUserId, game.founderToken)
     if (!quotaCheck.ok) {
-      console.warn(`[quota] start_game blocked: ${quotaCheck.reason}`)
+      console.warn(`[quota] start_game blocked: ${quotaCheck.reason} mode=${game.userMode}`)
       socket.emit('error_msg', {
         message: quotaCheck.reason === 'BETA_DISABLED'
           ? 'Beta 暫時關閉維護中，稍後再來。'
@@ -628,12 +672,13 @@ io.on('connection', (socket) => {
         event_type: 'quota_blocked',
         timestamp: new Date().toISOString(),
         error_code: quotaCheck.reason,
+        user_mode: game.userMode,
       })
       return
     }
 
-    // ====== 記錄開局 + 抽 template ======
-    QuotaChecker.recordStart(game.anonUserId)
+    // ====== 記錄開局 + 抽 template (P0-3: pass founderToken) ======
+    QuotaChecker.recordStart(game.anonUserId, game.founderToken)
     const category = payload?.category as SceneCategory | undefined
     const template = category ? pickTemplateByCategory(category) : pickRandomTemplate()
     game.template = template
@@ -642,7 +687,7 @@ io.on('connection', (socket) => {
     const turnId = 0  // 開場算 turn 0
     const generationId = game.currentGenerationId
 
-    console.log(`[start_game] ${socket.id} template=${template.id} gen=${generationId.slice(0,8)}`)
+    console.log(`[start_game] ${socket.id} template=${template.id} gen=${generationId.slice(0,8)} mode=${game.userMode}`)
 
     // 送 turn_start（帶 ID）
     socket.emit('turn_start', { sessionId: socket.id, turnId, generationId, turn: 0 })
@@ -668,7 +713,11 @@ io.on('connection', (socket) => {
       timestamp: new Date().toISOString(),
       category: template.category,
       template_id: template.id,
+      user_mode: game.userMode,
     })
+
+    // P0-0: track whether any playable response (text_chunk) was sent to the user
+    let playableResponseSent = false
 
     try {
       const trigger = templateToOpeningPrompt(template)
@@ -690,6 +739,7 @@ io.on('connection', (socket) => {
         undefined,  // abortSignal
         undefined,  // onLLMDone
         { sessionId: socket.id, turnId, generationId, anonUserId: game.anonUserId },
+        () => { playableResponseSent = true },  // P0-0: onFirstTextChunk
       )
 
       // 開場白永遠回傳 isEnding=false（帶 ID）
@@ -710,12 +760,22 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
         completed: true,
         extra: { turn_total_ms: Date.now() - turnStart },
+        user_mode: game.userMode,
       })
     } catch (err: any) {
       console.error('[start_game error]', err?.message || err)
+
+      // P0-0: refund quota if no playable response was sent (LLM/ASR failed before any text_chunk)
+      let quotaRefunded = false
+      if (!playableResponseSent) {
+        QuotaChecker.refundStart(game.anonUserId, game.founderToken)
+        quotaRefunded = true
+        console.log(`[quota] refunded start_game for ${socket.id} mode=${game.userMode} (no playable response)`)
+      }
+
       socket.emit('error_msg', {
         sessionId: socket.id, turnId, generationId,
-        message: '開場生成失敗，請重試',
+        message: pickNarrativeError(),  // P0-1: narrative error copy
         code: 'START_GAME_FAIL',
       })
       logUsage({
@@ -727,6 +787,8 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
         error_code: String(err?.code || err?.status || 'LLM_FAIL'),
         dropped: true,
+        user_mode: game.userMode,
+        quota_refunded: quotaRefunded,
       })
     }
   })
@@ -761,7 +823,15 @@ io.on('connection', (socket) => {
     const generationId = randomUUID()
     game.currentGenerationId = generationId  // 這行之後，舊 generation 的 emit 前端會 discard
 
-    console.log(`[submit_audio] ${socket.id} gen=${generationId.slice(0,8)} bytes=${audioBytes} turn=${nextTurn}`)
+    // P0-1: emit generation_start BEFORE ASR, so frontend updates its generationId ref
+    // (prevents error_msg from being discarded when ASR fails — fixes "stuck in 理解中" race)
+    socket.emit('generation_start', {
+      sessionId: socket.id,
+      turnId: nextTurn,
+      generationId,
+    })
+
+    console.log(`[submit_audio] ${socket.id} gen=${generationId.slice(0,8)} bytes=${audioBytes} turn=${nextTurn} mode=${game.userMode}`)
 
     try {
       // 1. STT
@@ -775,7 +845,7 @@ io.on('connection', (socket) => {
       if (!userText || !userText.trim()) {
         socket.emit('error_msg', {
           sessionId: socket.id, turnId: nextTurn, generationId,
-          message: '聽不清楚，請再說一次',
+          message: pickNarrativeError(),  // P0-1: narrative error copy
           code: 'ASR_EMPTY',
         })
         logUsage({
@@ -788,6 +858,7 @@ io.on('connection', (socket) => {
           asr_latency_ms: asrLatency,
           audio_bytes_in: audioBytes,
           error_code: 'ASR_EMPTY',
+          user_mode: game.userMode,
         })
         return
       }
@@ -809,17 +880,19 @@ io.on('connection', (socket) => {
           event_type: 'safety_block_user',
           timestamp: new Date().toISOString(),
           error_code: userSafety.reason,
+          user_mode: game.userMode,
         })
 
         // 直接用 fallback 旁白當作 LLM 回應
         socket.emit('turn_start', { sessionId: socket.id, turnId: nextTurn, generationId, turn: nextTurn })
         const seq = 0
         socket.emit('text_chunk', { sessionId: socket.id, turnId: nextTurn, generationId, seq, text: fallbackText })
-        const audioBuffer = await textToSpeechWav(fallbackText)
-        if (audioBuffer.length > 0) {
+        // P0-fix: textToSpeechWav requires (text, sessionId); returns TTSResult with .buffer
+        const ttsResult = await textToSpeechWav(fallbackText, socket.id)
+        if (ttsResult.buffer.length > 0) {
           socket.emit('audio_chunk', {
             sessionId: socket.id, turnId: nextTurn, generationId, seq,
-            audio: audioBuffer.toString('base64'),
+            audio: ttsResult.buffer.toString('base64'),
             format: 'wav',
           })
         }
@@ -842,6 +915,7 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
         asr_latency_ms: asrLatency,
         audio_bytes_in: audioBytes,
+        user_mode: game.userMode,
       })
 
       // 2. 加入對話歷史
@@ -905,6 +979,7 @@ io.on('connection', (socket) => {
         completed: true,
         ending_type: finalEnding ? endingMeta?.endingType : undefined,
         extra: { turn_total_ms: Date.now() - turnStart, allow_ending: allowEnding },
+        user_mode: game.userMode,
       })
 
       if (finalEnding) {
@@ -925,15 +1000,15 @@ io.on('connection', (socket) => {
           completed: true,
           ending_type: endingMeta?.endingType,
           extra: endingMeta ? { title: endingMeta.title, verdict: endingMeta.verdict } : {},
+          user_mode: game.userMode,
         })
       }
     } catch (err: any) {
       console.error('[submit_audio error]', err?.message || err)
-      // P0-6: fallback — 送一個 fallback 旁白而不是硬報錯
-      const fallbackMsg = '一陣雜訊干擾了你的訊號，畫面短暫失焦。請再說一次你想做什麼。'
+      // P0-1: narrative error copy (was: '一陣雜訊干擾了你的訊號...')
       socket.emit('error_msg', {
         sessionId: socket.id, turnId: nextTurn, generationId,
-        message: fallbackMsg,
+        message: pickNarrativeError(),
         code: String(err?.code || err?.status || 'TURN_FAIL'),
       })
       logUsage({
@@ -945,6 +1020,7 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
         error_code: String(err?.code || err?.status || 'TURN_FAIL'),
         dropped: true,
+        user_mode: game.userMode,
       })
     }
   })
@@ -961,6 +1037,7 @@ io.on('connection', (socket) => {
       event_type: 'share_clicked',
       timestamp: new Date().toISOString(),
       share_clicked: true,
+      user_mode: game.userMode,
     })
   })
 
@@ -975,6 +1052,7 @@ io.on('connection', (socket) => {
       event_type: 'replay_clicked',
       timestamp: new Date().toISOString(),
       replay_clicked: true,
+      user_mode: game.userMode,
     })
   })
 
@@ -982,6 +1060,9 @@ io.on('connection', (socket) => {
   socket.on('reset_game', () => {
     const oldGame = games.get(socket.id)
     const anonUserId = oldGame?.anonUserId || UsageLogger.hashUserId(socket.id)
+    // P0-3: preserve founderToken and userMode across reset
+    const founderToken = oldGame?.founderToken
+    const userMode = oldGame?.userMode || 'public' as UserMode
     games.set(socket.id, {
       messages: [{ role: 'assistant', content: SYSTEM_PROMPT }],
       turnCount: 0,
@@ -989,9 +1070,11 @@ io.on('connection', (socket) => {
       sessionId: socket.id,
       currentGenerationId: '',
       anonUserId,
+      founderToken,
+      userMode,
     })
     socket.emit('reset_ok', { sessionId: socket.id })
-    console.log(`[reset] ${socket.id}`)
+    console.log(`[reset] ${socket.id} mode=${userMode}`)
   })
 
   socket.on('disconnect', () => {

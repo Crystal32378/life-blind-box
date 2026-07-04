@@ -47,9 +47,10 @@ const CATEGORY_EMOJI: Record<string, string> = {
 
 // ============ Constants ============
 const AUDIO_PLAYBACK_RATE = 1.0
-const DAILY_FREE_LIMIT = 3
+const DAILY_FREE_LIMIT = 5  // P0-2: aligned with server PER_IP_DAILY_LIMIT (was 3)
 const STORAGE_KEY_DATE = 'lbb_date'
 const STORAGE_KEY_COUNT = 'lbb_count'
+const STORAGE_KEY_FOUNDER_TOKEN = 'lbb_founder_token'  // P0-3: founder token (never in URL after first load)
 
 // ============ Helpers: Daily limit ============
 function getDailyCount(): { date: string; count: number } {
@@ -75,6 +76,21 @@ function incrementDailyCount(): number {
   return newCount
 }
 
+// P0-3: Founder token — parse from URL (?founder=TOKEN), store in localStorage, clean URL
+function getFounderToken(): string | null {
+  if (typeof window === 'undefined') return null
+  const urlParams = new URLSearchParams(window.location.search)
+  const urlToken = urlParams.get('founder')
+  if (urlToken) {
+    localStorage.setItem(STORAGE_KEY_FOUNDER_TOKEN, urlToken)
+    // Clean URL — remove token to avoid leaking via sharing/referrer
+    const newUrl = window.location.pathname
+    window.history.replaceState({}, '', newUrl)
+    return urlToken
+  }
+  return localStorage.getItem(STORAGE_KEY_FOUNDER_TOKEN)
+}
+
 // ============ Component ============
 export default function VoiceGamePage() {
   // === State ===
@@ -95,6 +111,8 @@ export default function VoiceGamePage() {
   // P1: text-only fallback mode（TTS circuit breaker 觸發）
   const [ttsMode, setTtsMode] = useState<'voice' | 'text_only'>('voice')
   const [ttsModeReason, setTtsModeReason] = useState<string>('')
+  // P0-3: founder mode tracking
+  const [userMode, setUserMode] = useState<'founder' | 'public'>('public')
 
   // ====== P0-1: generation tracking ======
   // currentGenerationId：前端只接受符合這個 ID 的 text/audio chunk，舊的全部 discard
@@ -238,6 +256,7 @@ export default function VoiceGamePage() {
       reconnection: true,
       reconnectionAttempts: 5,
       timeout: 8000,
+      auth: { founderToken: getFounderToken() },  // P0-3: send founder token via socket auth
     })
     socketRef.current = socket
 
@@ -258,7 +277,7 @@ export default function VoiceGamePage() {
       setCategories(data.categories)
     })
 
-    // P0-1: 接收 connected 事件（含 quota 資訊）
+    // P0-1: 接收 connected 事件（含 quota 資訊 + userMode, P0-3）
     socket.on('connected', (data: {
       sessionId: string
       anonUserId?: string
@@ -268,7 +287,10 @@ export default function VoiceGamePage() {
         betaDisabled: boolean
         globalRemaining: number
         globalLimit: number
+        userMode?: 'founder' | 'public'
+        founderModeEnabled?: boolean
       }
+      userMode?: 'founder' | 'public'
     }) => {
       if (data.quota) {
         setServerQuota({
@@ -276,6 +298,10 @@ export default function VoiceGamePage() {
           perIpLimit: data.quota.perIpLimit,
           betaDisabled: data.quota.betaDisabled,
         })
+      }
+      if (data.userMode) {
+        setUserMode(data.userMode)
+        console.log(`[connected] userMode=${data.userMode}`)
       }
     })
 
@@ -316,6 +342,18 @@ export default function VoiceGamePage() {
       if (typeof data.turnId === 'number') currentTurnIdRef.current = data.turnId
       setTurn(data.turn)
       setNarrationText('')
+    })
+
+    // P0-1: generation_start — server emits this BEFORE ASR, so we update our ref early
+    // (prevents error_msg from being discarded when ASR fails — fixes "stuck in 理解中" race)
+    socket.on('generation_start', (data: {
+      sessionId?: string
+      turnId?: number
+      generationId: string
+    }) => {
+      currentGenerationIdRef.current = data.generationId
+      if (typeof data.turnId === 'number') currentTurnIdRef.current = data.turnId
+      console.debug(`[generation_start] new gen=${data.generationId.slice(0,8)}`)
     })
 
     socket.on('scene_template', (data: SceneTemplateInfo & { generationId?: string }) => {
@@ -379,18 +417,26 @@ export default function VoiceGamePage() {
     })
 
     socket.on('status', (data: { stage: string; generationId?: string }) => {
-      if (data.generationId && data.generationId !== currentGenerationIdRef.current) return
+      // P0-1: always update generationId ref first (belt and suspenders, so error_msg is never orphaned)
+      if (data.generationId) {
+        currentGenerationIdRef.current = data.generationId
+      }
       if (data.stage === 'transcribing') {
         setPhaseSafe('transcribing')
       }
     })
 
     socket.on('error_msg', (data: { message: string; code?: string; generationId?: string }) => {
-      // P0-fix2: 有 generationId 且不是 current 的 error 直接 discard
-      // 沒有 generationId 的 global error（如 quota_blocked、connect 失敗）才照收
+      // P0-1: when in transcribing phase, accept error_msg even if generationId mismatches
+      // (prevents "stuck in 理解中" when ASR fails with new generationId that frontend hasn't seen)
       if (data.generationId && data.generationId !== currentGenerationIdRef.current) {
-        console.debug(`[discard error_msg] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
-        return
+        if (phaseRef.current !== 'transcribing') {
+          console.debug(`[discard error_msg] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
+          return
+        }
+        // In transcribing: accept the error, update ref to match
+        console.debug(`[error_msg] accepting in transcribing, updating gen ${data.generationId.slice(0,8)}`)
+        currentGenerationIdRef.current = data.generationId
       }
       setError(data.message)
       setPhaseSafe('idle')
@@ -426,6 +472,19 @@ export default function VoiceGamePage() {
     }, 60000)
     return () => clearInterval(interval)
   }, [])
+
+  // P0-1: 30s safety timeout for transcribing phase (prevents permanent "理解中" stuck state)
+  useEffect(() => {
+    if (phase !== 'transcribing') return
+    const timer = setTimeout(() => {
+      if (phaseRef.current === 'transcribing') {
+        console.warn('[timeout] transcribing phase exceeded 30s, resetting to idle')
+        setError('命運線路短暫打結，請重新敲門。')
+        setPhaseSafe('idle')
+      }
+    }, 30000)
+    return () => clearTimeout(timer)
+  }, [phase, setPhaseSafe])
 
   // ============ Recording ============
   const startRecording = useCallback(async () => {
@@ -521,11 +580,14 @@ export default function VoiceGamePage() {
 
   // ============ Game Actions ============
   const startGame = useCallback((category?: string) => {
-    // 檢查 daily limit
-    const { count } = getDailyCount()
-    if (count >= DAILY_FREE_LIMIT) {
-      setError(`今日已玩 ${DAILY_FREE_LIMIT} 局免費額度，明天再來吧。`)
-      return
+    // P0-2/P0-3: founder mode skips local quota check (server is source of truth)
+    // P0-2: public mode uses serverQuota when available, falls back to local count
+    if (userMode !== 'founder') {
+      const remaining = serverQuota?.perIpRemaining ?? Math.max(0, DAILY_FREE_LIMIT - getDailyCount().count)
+      if (remaining <= 0) {
+        setError(`今日已玩 ${DAILY_FREE_LIMIT} 局免費額度，明天再來吧。`)
+        return
+      }
     }
     setError(null)
     setSubtitles([])
@@ -542,7 +604,7 @@ export default function VoiceGamePage() {
     const newCount = incrementDailyCount()
     setDailyCount(newCount)
     socketRef.current?.emit('start_game', category ? { category } : {})
-  }, [interruptPlayback, setPhaseSafe])
+  }, [interruptPlayback, setPhaseSafe, userMode, serverQuota])
 
   const resetGame = useCallback(() => {
     interruptPlayback()
@@ -623,8 +685,12 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
   }, [buildShareText, handleShareCopy, emitShareClicked])
 
   // ============ Render ============
-  const canRecord = connected && (phase === 'idle' || phase === 'narrating' || phase === 'transcribing') && phase !== 'ended'
-  const remainingToday = Math.max(0, DAILY_FREE_LIMIT - dailyCount)
+  const canRecord = connected && (phase === 'idle' || phase === 'narrating' || phase === 'transcribing')
+  // P0-2: server is source of truth for quota; fall back to local count for SSR/initial
+  const effectiveLimit = serverQuota?.perIpLimit || DAILY_FREE_LIMIT
+  const remainingToday = userMode === 'founder'
+    ? (serverQuota?.perIpRemaining ?? 100)
+    : (serverQuota?.perIpRemaining ?? Math.max(0, DAILY_FREE_LIMIT - dailyCount))
   const isOutOfCredits = remainingToday === 0 && phase === 'idle' && subtitles.length === 0
   const openingText = subtitles.find(s => s.role === 'narrator')?.text || ''
   const endingText = subtitles.filter(s => s.role === 'narrator').slice(-1)[0]?.text || ''
@@ -670,8 +736,13 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
           <span className="text-xs text-zinc-500 tracking-widest">
             TURN {turn} / 5
           </span>
+          {userMode === 'founder' && (
+            <span className="text-xs tracking-widest text-amber-300 bg-amber-950/40 border border-amber-800/50 px-2 py-0.5 rounded-full">
+              FOUNDER
+            </span>
+          )}
           <span className={`text-xs tracking-widest ${remainingToday === 0 ? 'text-red-400' : remainingToday === 1 ? 'text-amber-400' : 'text-zinc-500'}`}>
-            · {remainingToday}/{DAILY_FREE_LIMIT} LEFT
+            · {remainingToday}/{effectiveLimit} LEFT
           </span>
         </div>
       </header>
@@ -733,7 +804,7 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
                 )}
               </>
             )}
-            {remainingToday > 0 && remainingToday < DAILY_FREE_LIMIT && (
+            {userMode !== 'founder' && remainingToday > 0 && remainingToday < effectiveLimit && (
               <p className="text-xs text-zinc-600 tracking-widest">
                 今日剩餘 {remainingToday} 局免費
               </p>
