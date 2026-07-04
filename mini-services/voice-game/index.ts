@@ -8,6 +8,7 @@ import { usageLogger, logUsage, UsageLogger } from './usage-logger'
 import { QuotaChecker, UserMode } from './quota'
 import { checkContentSafety, checkLLMOutput, checkUserInput, SAFETY_FALLBACK_NARRATION } from './safety'
 import { TTSCircuitBreaker } from './tts-circuit-breaker'
+import { ASRCircuitBreaker } from './asr-circuit-breaker'
 import { textToSpeechOpenAI, isOpenAIConfigured } from './openai-tts'
 import { streamLLMViaOpenAI, isOpenAILLMConfigured } from './openai-llm'
 
@@ -57,6 +58,7 @@ const httpServer = createServer((req, res) => {
       openai_configured: isOpenAIConfigured(),
       openai_llm_configured: isOpenAILLMConfigured(),
       circuit_breaker: breakerStatus,
+      asr_circuit_breaker: ASRCircuitBreaker.getStatus(),
       founder_mode_enabled: QuotaChecker.isFounderModeEnabled(),
       uptime_ms: Date.now() - startTime,
     }))
@@ -343,28 +345,54 @@ async function textToSpeechWav(text: string, sessionId: string): Promise<TTSResu
 /**
  * STT：base64 音訊 -> 文字 (via z.ai ASR)。
  * 失敗時指數 backoff 重試 3 次。
+ * ASR 429 時記錄到 ASRCircuitBreaker（不在此處觸發 cooldown，由 caller 決定）。
  */
-async function speechToText(base64Audio: string, _mimeType: string = 'audio/webm'): Promise<string> {
+async function speechToText(base64Audio: string, _mimeType: string = 'audio/webm', sessionId?: string): Promise<string> {
   const zai = await getZAI()
   let lastErr: any = null
+  let retryCount = 0
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const response = await zai.audio.asr.create({
         file_base64: base64Audio,
       })
+      // 成功：記錄到 circuit breaker，重置 session 連續失敗
+      if (sessionId) ASRCircuitBreaker.recordSuccess(sessionId)
       return response.text || ''
     } catch (err: any) {
       lastErr = err
       const msg = String(err?.message || err)
+      const is429 = msg.includes('429') || msg.includes('Too many requests')
       console.error(`[ASR error attempt ${attempt + 1}]`, msg.slice(0, 200))
-      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5')) {
-        const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
-        console.log(`[ASR retry] attempt=${attempt + 1} backoff=${backoff}ms`)
-        await new Promise(r => setTimeout(r, backoff))
-        continue
+
+      if (is429) {
+        // Bug C Level 1: 記錄到 ASR circuit breaker
+        if (sessionId) ASRCircuitBreaker.record429(sessionId)
+        retryCount++
+        if (attempt < 2) {
+          const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
+          console.log(`[ASR retry] attempt=${attempt + 1} backoff=${backoff}ms`)
+          await new Promise(r => setTimeout(r, backoff))
+          continue
+        }
+      } else if (msg.includes('5')) {
+        // 5xx 也重試
+        retryCount++
+        if (attempt < 2) {
+          const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
+          console.log(`[ASR retry] attempt=${attempt + 1} backoff=${backoff}ms (5xx)`)
+          await new Promise(r => setTimeout(r, backoff))
+          continue
+        }
       }
+      // 非 429/5xx 直接 throw
       throw err
     }
+  }
+  // 把 retryCount 附在 error 上，供 caller 記錄
+  if (lastErr) {
+    (lastErr as any).asrRetryCount = retryCount
+    (lastErr as any).asrRateLimited = true
   }
   throw lastErr
 }
@@ -912,16 +940,73 @@ io.on('connection', (socket) => {
 
     console.log(`[submit_audio] ${socket.id} gen=${generationId.slice(0,8)} bytes=${audioBytes} turn=${nextTurn} mode=${game.userMode}`)
 
+    // ====== Bug C Level 1: ASR circuit breaker check ======
+    // 如果 ASR circuit 已開，不打 provider，直接回 rate_limited error_msg
+    const asrBreakerStatus = ASRCircuitBreaker.check(socket.id)
+    if (asrBreakerStatus.mode === 'asr_rate_limited') {
+      const cooldownSec = Math.ceil((asrBreakerStatus.retryAfterMs || 0) / 1000)
+      console.warn(`[asr-circuit-breaker] submit_audio blocked: ${asrBreakerStatus.reason} cooldown=${cooldownSec}s`)
+      socket.emit('error_msg', {
+        sessionId: socket.id, turnId: nextTurn, generationId,
+        message: `語音辨識暫時忙碌，請等 ${cooldownSec} 秒後再試。`,
+        code: 'ASR_RATE_LIMITED',
+        asrCircuitOpen: true,
+        cooldownMs: asrBreakerStatus.retryAfterMs,
+      })
+      logUsage({
+        session_id: socket.id,
+        anon_user_id: game.anonUserId,
+        turn_id: nextTurn,
+        generation_id: generationId,
+        event_type: 'asr_circuit_open',
+        timestamp: new Date().toISOString(),
+        error_code: asrBreakerStatus.reason || 'ASR_RATE_LIMITED',
+        user_mode: game.userMode,
+        extra: {
+          asr_circuit_open: true,
+          asr_rate_limited: true,
+          cooldown_until: new Date(Date.now() + (asrBreakerStatus.retryAfterMs || 0)).toISOString(),
+          cooldown_ms: asrBreakerStatus.retryAfterMs,
+          not_charged: true,  // Bug C: ASR 429 不扣 quota
+        },
+      })
+      return  // terminal event = error_msg, frontend phase → idle
+    }
+
+    // ====== Structured event log (per 大G Bug C diagnostic) ======
+    const eventChain = {
+      sessionId: socket.id,
+      generationId,
+      turnCountBefore: game.turnCount,
+      nextTurn,
+      phase: 'submit_audio_start',
+      asrStarted: false,
+      asrDone: false,
+      asrError: null as any,
+      asrErrorCode: null as any,
+      asrRetryCount: 0,
+      asrCircuitOpen: false,
+      llmStarted: false,
+      textChunkEmitted: 0,
+      audioChunkEmitted: 0,
+      turnCompleteEmitted: false,
+      gameOverEmitted: false,
+      errorMsgEmitted: false,
+    }
+
     try {
       // 1. STT
       const t0 = Date.now()
+      eventChain.asrStarted = true
       socket.emit('status', { sessionId: socket.id, turnId: nextTurn, generationId, stage: 'transcribing' })
       const mimeType = payload.format || 'audio/webm'
-      const userText = await speechToText(payload.audio, mimeType)
+      const userText = await speechToText(payload.audio, mimeType, socket.id)
       const asrLatency = Date.now() - t0
+      eventChain.asrDone = true
       console.log(`[STT] ${socket.id} gen=${generationId.slice(0,8)} time=${asrLatency}ms text="${userText}"`)
 
       if (!userText || !userText.trim()) {
+        eventChain.errorMsgEmitted = true
         socket.emit('error_msg', {
           sessionId: socket.id, turnId: nextTurn, generationId,
           message: pickNarrativeError(),  // P0-1: narrative error copy
@@ -938,8 +1023,9 @@ io.on('connection', (socket) => {
           audio_bytes_in: audioBytes,
           error_code: 'ASR_EMPTY',
           user_mode: game.userMode,
+          extra: { not_charged: true, event_chain: eventChain },
         })
-        return
+        return  // terminal event = error_msg
       }
 
       // ====== P0-4: 檢查使用者輸入安全性 ======
@@ -1091,6 +1177,7 @@ io.on('connection', (socket) => {
         turn: game.turnCount,
         isEnding: effectiveEnding,
       })
+      eventChain.turnCompleteEmitted = true
 
       logUsage({
         session_id: socket.id,
@@ -1101,11 +1188,12 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
         completed: true,
         ending_type: effectiveEnding ? effectiveMeta?.endingType : undefined,
-        extra: { turn_total_ms: Date.now() - turnStart, allow_ending: allowEnding, forced_ending: wasForcedEnding },
+        extra: { turn_total_ms: Date.now() - turnStart, allow_ending: allowEnding, forced_ending: wasForcedEnding, event_chain: eventChain },
         user_mode: game.userMode,
       })
 
       if (effectiveEnding) {
+        eventChain.gameOverEmitted = true
         socket.emit('game_over', {
           sessionId: socket.id,
           turnId: nextTurn,
@@ -1128,11 +1216,25 @@ io.on('connection', (socket) => {
       }
     } catch (err: any) {
       console.error('[submit_audio error]', err?.message || err)
-      // P0-1: narrative error copy (was: '一陣雜訊干擾了你的訊號...')
+      // Bug C Level 1: 記錄 structured event chain
+      eventChain.asrError = String(err?.message || err).slice(0, 200)
+      eventChain.asrErrorCode = String(err?.code || err?.status || 'TURN_FAIL')
+      eventChain.asrRetryCount = (err as any)?.asrRetryCount || 0
+      const isAsrRateLimited = !!(err as any)?.asrRateLimited
+      eventChain.asrCircuitOpen = isAsrRateLimited
+      eventChain.errorMsgEmitted = true
+
+      // Bug C Level 1: ASR 429 用明確文案，不用模糊命運文案
+      const errMsg = isAsrRateLimited
+        ? '語音辨識暫時忙碌，請稍後再試。'
+        : pickNarrativeError()
+      const errCode = isAsrRateLimited ? 'ASR_RATE_LIMITED' : String(err?.code || err?.status || 'TURN_FAIL')
+
       socket.emit('error_msg', {
         sessionId: socket.id, turnId: nextTurn, generationId,
-        message: pickNarrativeError(),
-        code: String(err?.code || err?.status || 'TURN_FAIL'),
+        message: errMsg,
+        code: errCode,
+        asrCircuitOpen: isAsrRateLimited,
       })
       logUsage({
         session_id: socket.id,
@@ -1141,9 +1243,17 @@ io.on('connection', (socket) => {
         generation_id: generationId,
         event_type: 'turn_error',
         timestamp: new Date().toISOString(),
-        error_code: String(err?.code || err?.status || 'TURN_FAIL'),
+        error_code: errCode,
         dropped: true,
         user_mode: game.userMode,
+        // Bug C: ASR 429 不扣 quota
+        quota_refunded: isAsrRateLimited,
+        extra: {
+          not_charged: isAsrRateLimited,
+          asr_rate_limited: isAsrRateLimited,
+          asr_retry_count: eventChain.asrRetryCount,
+          event_chain: eventChain,
+        },
       })
     }
   })

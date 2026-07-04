@@ -113,6 +113,9 @@ export default function VoiceGamePage() {
   const [ttsModeReason, setTtsModeReason] = useState<string>('')
   // P0-3: founder mode tracking
   const [userMode, setUserMode] = useState<'founder' | 'public'>('public')
+  // Bug C Level 1: ASR circuit breaker cooldown tracking
+  const [asrCooldownUntil, setAsrCooldownUntil] = useState<number>(0)
+  const [asrCooldownSec, setAsrCooldownSec] = useState<number>(0)
 
   // ====== P0-1: generation tracking ======
   // currentGenerationId：前端只接受符合這個 ID 的 text/audio chunk，舊的全部 discard
@@ -449,7 +452,7 @@ export default function VoiceGamePage() {
       }
     })
 
-    socket.on('error_msg', (data: { message: string; code?: string; generationId?: string }) => {
+    socket.on('error_msg', (data: { message: string; code?: string; generationId?: string; asrCircuitOpen?: boolean; cooldownMs?: number }) => {
       // P0-1: when in transcribing phase, accept error_msg even if generationId mismatches
       // (prevents "stuck in 理解中" when ASR fails with new generationId that frontend hasn't seen)
       if (data.generationId && data.generationId !== currentGenerationIdRef.current) {
@@ -460,6 +463,13 @@ export default function VoiceGamePage() {
         // In transcribing: accept the error, update ref to match
         console.debug(`[error_msg] accepting in transcribing, updating gen ${data.generationId.slice(0,8)}`)
         currentGenerationIdRef.current = data.generationId
+      }
+      // Bug C Level 1: ASR circuit open → disable mic during cooldown
+      if (data.asrCircuitOpen && data.cooldownMs) {
+        const cooldownSec = Math.ceil(data.cooldownMs / 1000)
+        console.warn(`[asr-rate-limited] circuit open, cooldown ${cooldownSec}s`)
+        setAsrCooldownUntil(Date.now() + data.cooldownMs)
+        setAsrCooldownSec(cooldownSec)
       }
       setError(data.message)
       setPhaseSafe('idle')
@@ -508,6 +518,10 @@ export default function VoiceGamePage() {
     }, 30000)
     return () => clearTimeout(timer)
   }, [phase, setPhaseSafe])
+
+  // Bug C Level 1: ASR cooldown countdown ticker
+  // (moved after asrInCooldown declaration to avoid TDZ error)
+  // Effect is defined later, after canRecord/asrInCooldown are declared
 
   // ============ Recording ============
   const startRecording = useCallback(async () => {
@@ -710,7 +724,27 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
   }, [buildShareText, handleShareCopy, emitShareClicked])
 
   // ============ Render ============
-  const canRecord = connected && (phase === 'idle' || phase === 'narrating' || phase === 'transcribing')
+  // Bug C Level 1: disable mic during ASR circuit breaker cooldown
+  const asrInCooldown = asrCooldownUntil > Date.now()
+  const canRecord = connected && (phase === 'idle' || phase === 'narrating' || phase === 'transcribing') && !asrInCooldown
+
+  // Bug C Level 1: ASR cooldown countdown ticker (must be after asrInCooldown declaration)
+  useEffect(() => {
+    if (!asrInCooldown) {
+      setAsrCooldownSec(0)
+      return
+    }
+    const tick = () => {
+      const remaining = Math.max(0, Math.ceil((asrCooldownUntil - Date.now()) / 1000))
+      setAsrCooldownSec(remaining)
+      if (remaining <= 0) {
+        setAsrCooldownUntil(0)
+      }
+    }
+    tick()
+    const interval = setInterval(tick, 1000)
+    return () => clearInterval(interval)
+  }, [asrInCooldown, asrCooldownUntil])
   // P0-2: server is source of truth for quota; fall back to local count for SSR/initial
   const effectiveLimit = serverQuota?.perIpLimit || DAILY_FREE_LIMIT
   const remainingToday = userMode === 'founder'
@@ -1116,7 +1150,8 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
             )}
           </button>
           <p className="text-xs text-zinc-500 tracking-widest text-center">
-            {phase === 'recording' ? '鬆手送出' :
+            {asrInCooldown ? `語音辨識忙碌中 · ${asrCooldownSec}s 後可重試` :
+             phase === 'recording' ? '鬆手送出' :
              isPlaying ? 'AI 說話中 · 按住可搶話' :
              phase === 'transcribing' ? '理解中...' :
              phase === 'narrating' ? '旁白中 · 按住可搶話' :
