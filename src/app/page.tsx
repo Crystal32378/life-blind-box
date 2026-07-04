@@ -346,14 +346,21 @@ export default function VoiceGamePage() {
 
     // P0-1: generation_start — server emits this BEFORE ASR, so we update our ref early
     // (prevents error_msg from being discarded when ASR fails — fixes "stuck in 理解中" race)
+    // P0-fix-audio: also reset audio playback state here, to clear any stale audio from
+    // previous turn's background TTS that sneaked in between interruptPlayback (startRecording)
+    // and generation_start (server response). Without this, nextPlaySeqRef gets incremented
+    // by stale audio, causing turn N's audio to be out of sync → choppy playback from turn 3+.
     socket.on('generation_start', (data: {
       sessionId?: string
       turnId?: number
       generationId: string
     }) => {
+      console.debug(`[generation_start] new gen=${data.generationId.slice(0,8)}, resetting audio state`)
+      // Reset audio playback state BEFORE updating generationId,
+      // so any in-flight audio_chunk from old generation is cleanly discarded
+      interruptPlayback()
       currentGenerationIdRef.current = data.generationId
       if (typeof data.turnId === 'number') currentTurnIdRef.current = data.turnId
-      console.debug(`[generation_start] new gen=${data.generationId.slice(0,8)}`)
     })
 
     socket.on('scene_template', (data: SceneTemplateInfo & { generationId?: string }) => {
