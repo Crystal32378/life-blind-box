@@ -116,6 +116,9 @@ export default function VoiceGamePage() {
   // Bug C Level 1: ASR circuit breaker cooldown tracking
   const [asrCooldownUntil, setAsrCooldownUntil] = useState<number>(0)
   const [asrCooldownSec, setAsrCooldownSec] = useState<number>(0)
+  // QA-anchored: track server commit hash + env for badge
+  const [serverCommitHash, setServerCommitHash] = useState<string>('')
+  const [serverEnv, setServerEnv] = useState<string>('')
 
   // ====== P0-1: generation tracking ======
   // currentGenerationId：前端只接受符合這個 ID 的 text/audio chunk，舊的全部 discard
@@ -303,6 +306,8 @@ export default function VoiceGamePage() {
         founderModeEnabled?: boolean
       }
       userMode?: 'founder' | 'public'
+      commitHash?: string
+      env?: string
     }) => {
       if (data.quota) {
         setServerQuota({
@@ -315,6 +320,9 @@ export default function VoiceGamePage() {
         setUserMode(data.userMode)
         console.log(`[connected] userMode=${data.userMode}`)
       }
+      // QA-anchored: capture commit hash + env for badge
+      if (data.commitHash) setServerCommitHash(data.commitHash)
+      if (data.env) setServerEnv(data.env)
     })
 
     // P0-1: text_chunk 帶 generationId，舊的 discard
@@ -798,6 +806,11 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
           {userMode === 'founder' && (
             <span className="text-xs tracking-widest text-amber-300 bg-amber-950/40 border border-amber-800/50 px-2 py-0.5 rounded-full">
               FOUNDER
+            </span>
+          )}
+          {serverCommitHash && (
+            <span className="text-xs tracking-widest text-blue-300 bg-blue-950/40 border border-blue-800/50 px-2 py-0.5 rounded-full" title={`env: ${serverEnv}`}>
+              QA · {serverCommitHash.slice(0,7)} · {userMode}
             </span>
           )}
           <span className={`text-xs tracking-widest ${remainingToday === 0 ? 'text-red-400' : remainingToday === 1 ? 'text-amber-400' : 'text-zinc-500'}`}>

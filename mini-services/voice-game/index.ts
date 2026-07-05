@@ -47,6 +47,11 @@ function pickNarrativeError(): string {
 }
 
 // ====== HTTP + Socket.io server ======
+// QA-anchored /health: commit hash + env so Crystal can verify running code = disk code
+const COMMIT_HASH = process.env.COMMIT_HASH || 'unknown'
+const QA_ENV = process.env.QA_ENV || 'sandbox-qa'
+const startTime = Date.now()
+
 const httpServer = createServer((req, res) => {
   // P1: monitor endpoint for circuit breaker status
   if (req.url === '/health') {
@@ -54,20 +59,21 @@ const httpServer = createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({
       ok: true,
+      env: QA_ENV,
+      commit: COMMIT_HASH,
+      uptime_ms: Date.now() - startTime,
       tts_provider: TTS_PROVIDER,
       openai_configured: isOpenAIConfigured(),
       openai_llm_configured: isOpenAILLMConfigured(),
       circuit_breaker: breakerStatus,
       asr_circuit_breaker: ASRCircuitBreaker.getStatus(),
       founder_mode_enabled: QuotaChecker.isFounderModeEnabled(),
-      uptime_ms: Date.now() - startTime,
     }))
     return
   }
   res.writeHead(404)
   res.end('Not Found')
 })
-const startTime = Date.now()
 
 const io = new Server(httpServer, {
   path: '/',
@@ -739,6 +745,8 @@ io.on('connection', (socket) => {
     anonUserId,
     quota: quotaStatus,
     userMode,
+    commitHash: COMMIT_HASH,
+    env: QA_ENV,
   })
 
   // 列出所有可用類別（給前端顯示用）
