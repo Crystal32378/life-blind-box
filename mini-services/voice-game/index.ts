@@ -11,6 +11,7 @@ import { TTSCircuitBreaker } from './tts-circuit-breaker'
 import { ASRCircuitBreaker } from './asr-circuit-breaker'
 import { textToSpeechOpenAI, isOpenAIConfigured } from './openai-tts'
 import { streamLLMViaOpenAI, isOpenAILLMConfigured } from './openai-llm'
+import { speechToTextOpenAI, isOpenAIASRConfigured } from './openai-asr'
 
 // ====== Types ======
 interface GameState {
@@ -62,9 +63,12 @@ const httpServer = createServer((req, res) => {
       env: QA_ENV,
       commit: COMMIT_HASH,
       uptime_ms: Date.now() - startTime,
+      llm_provider: LLM_PROVIDER,
+      asr_provider: ASR_PROVIDER,
       tts_provider: TTS_PROVIDER,
       openai_configured: isOpenAIConfigured(),
       openai_llm_configured: isOpenAILLMConfigured(),
+      openai_asr_configured: isOpenAIASRConfigured(),
       circuit_breaker: breakerStatus,
       asr_circuit_breaker: ASRCircuitBreaker.getStatus(),
       founder_mode_enabled: QuotaChecker.isFounderModeEnabled(),
@@ -169,6 +173,9 @@ function extractDelta(data: string): string {
 /**
  * 串流呼叫 LLM (via OpenAI SDK + z.ai gateway → GLM-4-plus)。
  */
+// ====== LLM provider config ======
+const LLM_PROVIDER = process.env.LLM_PROVIDER || 'auto'  // 'zai' | 'openai' | 'auto'
+
 async function streamLLM(
   messages: Array<{ role: string; content: string }>,
   onText: (chunk: string) => void,
@@ -176,10 +183,22 @@ async function streamLLM(
 ): Promise<string> {
   let fullText = ''
   const t0 = Date.now()
-  console.log(`[LLM] starting stream, model=${LLM_MODEL}, messages=${messages.length}`)
+
+  // ====== LLM_PROVIDER=openai: 只用 OpenAI ======
+  if (LLM_PROVIDER === 'openai') {
+    if (!isOpenAILLMConfigured()) {
+      throw new Error('LLM_PROVIDER=openai but OPENAI_API_KEY not set')
+    }
+    console.log(`[LLM] provider=openai, messages=${messages.length}`)
+    fullText = await streamLLMViaOpenAI(messages, onText, abortSignal)
+    console.log(`[LLM] openai stream ended after ${Date.now() - t0}ms, textLen=${fullText.length}`)
+    return fullText
+  }
+
+  // ====== LLM_PROVIDER=zai or auto: 先 z.ai，429 → fallback OpenAI ======
+  console.log(`[LLM] provider=${LLM_PROVIDER} primary=zai, model=${LLM_MODEL}, messages=${messages.length}`)
 
   try {
-    // Primary: z.ai gateway
     const stream = await openai.chat.completions.create({
       model: LLM_MODEL,
       messages: messages as any,
@@ -201,10 +220,11 @@ async function streamLLM(
     console.log(`[LLM] stream ended after ${Date.now() - t0}ms, chunks=${chunkCount}, textLen=${fullText.length}`)
     return fullText
   } catch (err: any) {
-    // P1: LLM fallback to OpenAI (implemented, not env-verified — sandbox 403)
     const msg = String(err?.message || err)
     const is429 = msg.includes('429') || msg.includes('Too many requests')
-    if (is429 && isOpenAILLMConfigured()) {
+
+    // auto mode: z.ai 429 → fallback OpenAI
+    if (LLM_PROVIDER === 'auto' && is429 && isOpenAILLMConfigured()) {
       console.warn(`[LLM] z.ai 429, falling back to OpenAI: ${msg.slice(0, 100)}`)
       try {
         fullText = await streamLLMViaOpenAI(messages, onText, abortSignal)
@@ -348,12 +368,81 @@ async function textToSpeechWav(text: string, sessionId: string): Promise<TTSResu
   throw new Error(`Unknown TTS_PROVIDER: ${TTS_PROVIDER}`)
 }
 
+// ====== ASR provider config ======
+const ASR_PROVIDER = process.env.ASR_PROVIDER || 'auto'  // 'zai' | 'openai' | 'auto'
+
 /**
- * STT：base64 音訊 -> 文字 (via z.ai ASR)。
+ * STT：base64 音訊 -> 文字。
+ * 根據 ASR_PROVIDER 決定用哪個 provider：
+ * - 'zai': 只用 Z.ai ASR
+ * - 'openai': 只用 OpenAI ASR (gpt-4o-mini-transcribe)
+ * - 'auto': 先 Z.ai，429 失敗 → fallback OpenAI
+ *
  * 失敗時指數 backoff 重試 3 次。
- * ASR 429 時記錄到 ASRCircuitBreaker（不在此處觸發 cooldown，由 caller 決定）。
+ * ASR 429 時記錄到 ASRCircuitBreaker。
  */
-async function speechToText(base64Audio: string, _mimeType: string = 'audio/webm', sessionId?: string): Promise<string> {
+async function speechToText(base64Audio: string, mimeType: string = 'audio/webm', sessionId?: string): Promise<string> {
+  let lastErr: any = null
+  let retryCount = 0
+
+  // ====== ASR_PROVIDER=openai: 只用 OpenAI ======
+  if (ASR_PROVIDER === 'openai') {
+    if (!isOpenAIASRConfigured()) {
+      throw new Error('ASR_PROVIDER=openai but OPENAI_API_KEY not set')
+    }
+    try {
+      const text = await speechToTextOpenAI(base64Audio, mimeType)
+      if (sessionId) ASRCircuitBreaker.recordSuccess(sessionId)
+      console.log(`[ASR] provider=openai model=${process.env.OPENAI_ASR_MODEL || 'gpt-4o-mini-transcribe'} text="${text}"`)
+      return text
+    } catch (err: any) {
+      const msg = String(err?.message || err)
+      console.error(`[ASR openai error]`, msg.slice(0, 200))
+      const is429 = msg.includes('429') || msg.includes('Too many requests')
+      if (is429 && sessionId) ASRCircuitBreaker.record429(sessionId)
+      ;(err as any).asrRetryCount = 0
+      ;(err as any).asrRateLimited = is429
+      throw err
+    }
+  }
+
+  // ====== ASR_PROVIDER=zai: 只用 Z.ai (original logic) ======
+  if (ASR_PROVIDER === 'zai') {
+    return speechToTextZai(base64Audio, mimeType, sessionId)
+  }
+
+  // ====== ASR_PROVIDER=auto: 先 Z.ai，429 → fallback OpenAI ======
+  if (ASR_PROVIDER === 'auto') {
+    try {
+      return await speechToTextZai(base64Audio, mimeType, sessionId)
+    } catch (err: any) {
+      const msg = String(err?.message || err)
+      const is429 = msg.includes('429') || msg.includes('Too many requests')
+      console.warn(`[ASR] Z.ai failed (${is429 ? '429' : 'other'}): ${msg.slice(0, 100)}`)
+
+      if (is429 && isOpenAIASRConfigured()) {
+        console.log('[ASR] falling back to OpenAI ASR')
+        try {
+          const text = await speechToTextOpenAI(base64Audio, mimeType)
+          if (sessionId) ASRCircuitBreaker.recordSuccess(sessionId)
+          console.log(`[ASR] OpenAI fallback succeeded: text="${text}"`)
+          return text
+        } catch (openaiErr: any) {
+          console.error(`[ASR] OpenAI fallback also failed:`, String(openaiErr?.message || openaiErr).slice(0, 100))
+          throw openaiErr
+        }
+      }
+      throw err
+    }
+  }
+
+  throw new Error(`Unknown ASR_PROVIDER: ${ASR_PROVIDER}`)
+}
+
+/**
+ * Z.ai ASR (original speechToText logic, extracted)
+ */
+async function speechToTextZai(base64Audio: string, _mimeType: string = 'audio/webm', sessionId?: string): Promise<string> {
   const zai = await getZAI()
   let lastErr: any = null
   let retryCount = 0
@@ -362,40 +451,35 @@ async function speechToText(base64Audio: string, _mimeType: string = 'audio/webm
       const response = await zai.audio.asr.create({
         file_base64: base64Audio,
       })
-      // 成功：記錄到 circuit breaker，重置 session 連續失敗
       if (sessionId) ASRCircuitBreaker.recordSuccess(sessionId)
       return response.text || ''
     } catch (err: any) {
       lastErr = err
       const msg = String(err?.message || err)
       const is429 = msg.includes('429') || msg.includes('Too many requests')
-      console.error(`[ASR error attempt ${attempt + 1}]`, msg.slice(0, 200))
+      console.error(`[ASR zai error attempt ${attempt + 1}]`, msg.slice(0, 200))
 
       if (is429) {
-        // Bug C Level 1: 記錄到 ASR circuit breaker
         if (sessionId) ASRCircuitBreaker.record429(sessionId)
         retryCount++
         if (attempt < 2) {
           const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
-          console.log(`[ASR retry] attempt=${attempt + 1} backoff=${backoff}ms`)
+          console.log(`[ASR zai retry] attempt=${attempt + 1} backoff=${backoff}ms`)
           await new Promise(r => setTimeout(r, backoff))
           continue
         }
       } else if (msg.includes('5')) {
-        // 5xx 也重試
         retryCount++
         if (attempt < 2) {
           const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
-          console.log(`[ASR retry] attempt=${attempt + 1} backoff=${backoff}ms (5xx)`)
+          console.log(`[ASR zai retry] attempt=${attempt + 1} backoff=${backoff}ms (5xx)`)
           await new Promise(r => setTimeout(r, backoff))
           continue
         }
       }
-      // 非 429/5xx 直接 throw
       throw err
     }
   }
-  // 把 retryCount 附在 error 上，供 caller 記錄
   if (lastErr) {
     (lastErr as any).asrRetryCount = retryCount
     (lastErr as any).asrRateLimited = true

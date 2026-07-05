@@ -265,12 +265,18 @@ export default function VoiceGamePage() {
 
   // ============ Socket ============
   useEffect(() => {
-    const socket = io('/?XTransformPort=3003', {
+    // QA-anchored: use NEXT_PUBLIC_VOICE_GAME_URL if set (Railway/staging)
+    // Otherwise use sandbox Caddy proxy path (/?XTransformPort=3003)
+    const voiceGameUrl = process.env.NEXT_PUBLIC_VOICE_GAME_URL || ''
+    const socketPath = voiceGameUrl ? '/' : '/'
+    const socketQuery = voiceGameUrl ? {} : { XTransformPort: '3003' }
+    const socket = io(voiceGameUrl + socketPath, {
       transports: ['websocket'],
       forceNew: true,
       reconnection: true,
       reconnectionAttempts: 5,
       timeout: 8000,
+      query: socketQuery,
       auth: { founderToken: getFounderToken() },  // P0-3: send founder token via socket auth
     })
     socketRef.current = socket
