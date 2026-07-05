@@ -96,6 +96,26 @@ Evidence content:
 - Crystal reported the game stuck on turn 2 during a new small-creature test.
 - This expands the stuck-flow bug line from a single turn-3 case into a broader early-turn progression stability issue.
 
+### Evidence 4: Evening Recording, Pending Annotation
+
+New path:
+
+```txt
+/Users/crystalchang/Desktop/螢幕錄影 2026-07-05 晚上9.24.01.mov
+```
+
+Local re-check metadata:
+
+- File exists at the delegated Desktop path during the 2026-07-05 evening Life Blind Box pass.
+- File size: 225,083,435 bytes, approximately 214.66 MB.
+- File timestamp: 2026-07-05 21:28:45 local time.
+- Original video was not renamed, moved, compressed, or transformed.
+
+Evidence content:
+
+- Pending annotation from Crystal.
+- Do not classify this recording as pass, fail, stuck, early-ending, or audio-only evidence until its observed behavior is explicitly annotated or reviewed.
+
 ## Important Correction
 
 Do not record the earlier `third successful run` as a successful completion.
@@ -164,6 +184,19 @@ Keep voice/audio instability in the observation log, but prioritize:
 2. early-turn stuck state on turn 2 or turn 3
 3. only then TTS/audio intermittency as contributing evidence
 
+### 4. Pending Evidence Needing Annotation
+
+The 2026-07-05 evening recording is preserved as evidence but not yet classified.
+
+Before routing it into an issue, annotate whether it shows:
+
+- successful full playthrough
+- early ending
+- stuck state
+- audio/TTS failure
+- quota/founder-mode behavior
+- another observed behavior
+
 ## Suggested Investigation Order
 
 1. Reproduce with logging enabled for one full session.
@@ -184,6 +217,7 @@ Keep voice/audio instability in the observation log, but prioritize:
 5. Ensure stuck paths always emit either `turn_complete`, a recoverable error, or a visible text-only fallback.
 6. Confirm stale generation events cannot end a newer or still-running game.
 7. For turn-2 and turn-3 stuck cases, inspect whether the failure happens before ASR result, after ASR result, during LLM stream, during TTS background work, or during frontend phase reset.
+8. Annotate the 2026-07-05 evening recording before using it as pass/fail evidence.
 
 ## Proposed Issue Drafts
 
@@ -221,10 +255,26 @@ Acceptance criteria:
 - The app does not remain indefinitely in a stuck recording/transcribing/narrating state.
 - The UI exposes enough status to tell whether it is waiting on ASR, LLM, TTS, reconnect, or fallback.
 
+### Issue C: Classify 2026-07-05 evening recording
+
+Priority: P2 until annotated
+
+Evidence: `/Users/crystalchang/Desktop/螢幕錄影 2026-07-05 晚上9.24.01.mov`
+
+Summary:
+A large evening recording exists and has been preserved as evidence, but its observed behavior has not been annotated yet.
+
+Acceptance criteria:
+
+- Recording is reviewed or Crystal provides a short behavior label.
+- The evidence is routed into the correct existing bug line or marked as pass.
+- No claim is made from this file until annotation is complete.
+
 ## Custody Notes
 
 - Preserve the original recordings as evidence.
 - Do not modify the video files.
 - Do not mark the 2026-07-04 test as pass.
 - Do not mark the 2026-07-05 turn-2 stuck test as pass.
+- Do not classify the 2026-07-05 evening recording until annotated.
 - This triage note is for bug routing and project memory, not final root-cause analysis.
