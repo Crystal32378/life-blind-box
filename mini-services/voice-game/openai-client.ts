@@ -1,10 +1,8 @@
-<<<<<<< Updated upstream
 import OpenAI from 'openai'
 import ZAI from 'z-ai-web-dev-sdk'
 import fs from 'fs'
 import path from 'path'
 
-// 讀取 z.ai 的設定（從 /etc/.z-ai-config）
 function loadZaiConfig() {
   const configPaths = [
     '/etc/.z-ai-config',
@@ -24,37 +22,36 @@ function loadZaiConfig() {
 const zaiCfg = loadZaiConfig()
 
 if (!zaiCfg) {
-  console.error('[FATAL] Cannot find /etc/.z-ai-config')
-  process.exit(1)
+  console.warn('[Gateway] No .z-ai-config found. z.ai providers will fail.')
+  console.warn('[Gateway] Set LLM_PROVIDER=openai, ASR_PROVIDER=openai, TTS_PROVIDER=openai to use OpenAI only.')
 }
 
-// 用 OpenAI SDK 走 z.ai 的 OpenAI-compatible gateway
-// 這樣可以享受 OpenAI SDK 的好處（typed、retry、stream），但實際跑 GLM 模型
 export const openai = new OpenAI({
-  apiKey: zaiCfg.apiKey,
-  baseURL: zaiCfg.baseUrl,
+  apiKey: zaiCfg?.apiKey || 'placeholder',
+  baseURL: zaiCfg?.baseUrl || 'https://placeholder.invalid',
   defaultHeaders: {
-    'X-Chat-Id': zaiCfg.chatId || '',
-    'X-User-Id': zaiCfg.userId || '',
-    'X-Token': zaiCfg.token || '',
+    'X-Chat-Id': zaiCfg?.chatId || '',
+    'X-User-Id': zaiCfg?.userId || '',
+    'X-Token': zaiCfg?.token || '',
     'X-Z-AI-From': 'Z',
   },
 })
 
-// ZAI 原生 instance（給 TTS / ASR 用，因為它們的 API 格式跟 OpenAI 不完全相容）
 let zaiInstance: any = null
-export async function getZAI() {
+export async function getZAI(): Promise<any> {
+  if (!zaiCfg) {
+    throw new Error('z.ai not configured (no .z-ai-config). Use OpenAI providers instead.')
+  }
   if (!zaiInstance) {
     zaiInstance = await ZAI.create()
   }
   return zaiInstance
 }
 
-// 模型選擇
 export const LLM_MODEL = process.env.LLM_MODEL || 'glm-4-plus'
 export const TTS_VOICE = process.env.TTS_VOICE || 'tongtong'
 
-console.log(`[Gateway] LLM=${LLM_MODEL} via ${zaiCfg.baseUrl}`)
+if (zaiCfg) {
+  console.log(`[Gateway] LLM=${LLM_MODEL} via ${zaiCfg.baseUrl}`)
+}
 console.log(`[Gateway] TTS voice=${TTS_VOICE}`)
-=======
->>>>>>> Stashed changes
