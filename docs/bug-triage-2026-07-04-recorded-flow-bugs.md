@@ -10,9 +10,15 @@ Related checkpoint: [`docs/openai-railway-qa-checkpoint-2026-07-05.md`](./openai
 
 Interpretation note: checkpoint `1b849d0` is a major Railway/OpenAI stability checkpoint, not a clean product pass. Bug E remains: final ending card can appear before final voice finishes.
 
-## Preview Under Test
+## Active Test URL
+
+https://frontend-production-9b60.up.railway.app/
+
+Historical Z.ai preview used by earlier evidence:
 
 https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/
+
+Use the Railway URL for new QA unless Crystal explicitly asks to inspect the historical preview.
 
 ## Test Environment
 
