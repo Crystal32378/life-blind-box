@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 import OpenAI from 'openai'
 import ZAI from 'z-ai-web-dev-sdk'
 import fs from 'fs'
@@ -55,3 +56,5 @@ export const TTS_VOICE = process.env.TTS_VOICE || 'tongtong'
 
 console.log(`[Gateway] LLM=${LLM_MODEL} via ${zaiCfg.baseUrl}`)
 console.log(`[Gateway] TTS voice=${TTS_VOICE}`)
+=======
+>>>>>>> Stashed changes
