@@ -20,6 +20,27 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/
   - `Command + Control + Esc` to stop recording
 - If the recording frame remains visible, use `killall screencaptureui` to clear the macOS screenshot/recording UI residue.
 
+## TTS Voice Quality Observation
+
+Current observed voice setup:
+
+- Provider: OpenAI TTS
+- Voice: `fable`
+- Character: male voice
+
+Crystal's subjective product read:
+
+- The voice is clear.
+- The voice has dramatic tension and works for the product direction.
+- It has a slight foreigner-speaking-Chinese pause pattern.
+- The pause/accent issue is minor and does not harm the experience.
+
+Product implication:
+
+- Do not treat the current OpenAI `fable` voice as a blocker.
+- Current higher-priority voice-drama issue is sequencing: the ending card can interrupt the final spoken story.
+- Continue monitoring TTS stability and latency, but voice quality itself is acceptable for controlled beta observation.
+
 ## Evidence Files
 
 Do not rename, move, compress, or transform these original video files unless Crystal explicitly asks for archival work.
