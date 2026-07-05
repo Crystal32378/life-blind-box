@@ -4,6 +4,7 @@ Date: 2026-07-05
 Status: checkpoint safe in cage
 Canonical checkpoint commit: `1b849d0`
 Branch: `fix-alpha-p0-recovery`
+Current test URL: https://frontend-production-9b60.up.railway.app/
 
 ## Purpose
 
@@ -13,6 +14,7 @@ This note prevents future agent confusion between:
 - imported local workspace archives
 - Railway running deployment state
 - recorded bug evidence that still needs re-test
+- historical Z.ai preview links versus the current Railway test link
 
 Do not treat this checkpoint as a clean product pass. It is a major stability checkpoint with one known remaining bug.
 
@@ -34,6 +36,14 @@ Do not treat this checkpoint as a clean product pass. It is a major stability ch
 | three-body-game | SUCCESS | separate repo |
 
 Railway running commit equals GitHub commit equals `1b849d0`.
+
+Current Railway frontend test URL:
+
+```txt
+https://frontend-production-9b60.up.railway.app/
+```
+
+Historical Z.ai preview URLs should be treated as evidence context only unless Crystal explicitly says to test them again.
 
 ## 3. Changed Files In Commit `1b849d0`
 
@@ -121,6 +131,8 @@ Future agents should treat this as the latest engineering checkpoint, not as fin
 Use these rules:
 
 - GitHub repo remains canonical.
+- Current test URL is `https://frontend-production-9b60.up.railway.app/`.
+- Do not use older Z.ai preview links as the active test target unless Crystal explicitly asks.
 - Do not commit imported tar archives or extracted `imported-workspaces` folders.
 - Preserve `docs/bug-triage-2026-07-04-recorded-flow-bugs.md` as evidence history.
 - Do not mark Bug E fixed until re-tested after the frontend sequencing fix.
