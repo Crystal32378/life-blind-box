@@ -6,6 +6,10 @@ Source thread: `019f2aee-2354-7b73-ac95-eb76a6299bce`
 Status: active bug triage
 Priority: P0/P1 before broader trained-tester expansion
 
+Related checkpoint: [`docs/openai-railway-qa-checkpoint-2026-07-05.md`](./openai-railway-qa-checkpoint-2026-07-05.md)
+
+Interpretation note: checkpoint `1b849d0` is a major Railway/OpenAI stability checkpoint, not a clean product pass. Bug E remains: final ending card can appear before final voice finishes.
+
 ## Preview Under Test
 
 https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/
