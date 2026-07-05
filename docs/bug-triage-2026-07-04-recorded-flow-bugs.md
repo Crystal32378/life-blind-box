@@ -96,7 +96,7 @@ Evidence content:
 - Crystal reported the game stuck on turn 2 during a new small-creature test.
 - This expands the stuck-flow bug line from a single turn-3 case into a broader early-turn progression stability issue.
 
-### Evidence 4: Evening Recording, Pending Annotation
+### Evidence 4: Turn 5 Reached, Ending Card Appears Before Final Voice Finishes
 
 New path:
 
@@ -113,8 +113,10 @@ Local re-check metadata:
 
 Evidence content:
 
-- Pending annotation from Crystal.
-- Do not classify this recording as pass, fail, stuck, early-ending, or audio-only evidence until its observed behavior is explicitly annotated or reviewed.
+- Crystal reports that the session did reach turn 5.
+- However, the ending card appeared before the fifth-turn story voice finished playing.
+- This is not a stuck-state case and not the same as the turn-4 early-ending bug.
+- It is a final-turn sequencing bug: `game_over` / ending-card UI is presented before final narration audio has landed emotionally.
 
 ## Important Correction
 
@@ -172,7 +174,27 @@ Likely areas to inspect:
 - Whether `currentGenerationIdRef` can advance while the visible UI still waits on an older turn
 - Whether `setPhaseSafe('idle')` is skipped when LLM/TTS/provider logic throws after partial output
 
-### 3. Intermittent Voice / Audio Observation
+### 3. Final-Turn Ending Card Races Ahead Of Voice
+
+Expected behavior:
+
+- On the final turn, the last story voice should finish, or the UI should clearly keep the player in a final narration state, before the ending card takes over the screen.
+- The ending card should feel like a payoff after the last sentence lands, not an interruption of the final spoken story.
+
+Observed behavior:
+
+- A 2026-07-05 evening recording reached turn 5.
+- The ending card appeared before the fifth-turn story voice finished playing.
+- This makes the voice drama feel cut off even though the logical game reached the final turn.
+
+Likely areas to inspect:
+
+- Backend currently emits `turn_complete` and `game_over` when LLM finishes, not when TTS playback finishes.
+- Frontend switches to `phase === 'ended'` immediately on `game_over`.
+- TTS chunks continue in the background, so final audio can still be playing after the ending card appears.
+- The final turn likely needs a special sequencing rule: delay `game_over` presentation until final audio queue is drained, or show the ending card only after a client-side `final_audio_done` transition.
+
+### 4. Intermittent Voice / Audio Observation
 
 Status: secondary observation
 
@@ -182,20 +204,8 @@ Keep voice/audio instability in the observation log, but prioritize:
 
 1. early ending after turn 4
 2. early-turn stuck state on turn 2 or turn 3
-3. only then TTS/audio intermittency as contributing evidence
-
-### 4. Pending Evidence Needing Annotation
-
-The 2026-07-05 evening recording is preserved as evidence but not yet classified.
-
-Before routing it into an issue, annotate whether it shows:
-
-- successful full playthrough
-- early ending
-- stuck state
-- audio/TTS failure
-- quota/founder-mode behavior
-- another observed behavior
+3. final-turn ending card racing ahead of voice
+4. only then TTS/audio intermittency as contributing evidence
 
 ## Suggested Investigation Order
 
@@ -212,12 +222,13 @@ Before routing it into an issue, annotate whether it shows:
    - `turn_complete`
    - `game_over`
    - `error_msg`
+   - client audio queue drained / final playback finished
 3. Compare backend `game.turnCount` against frontend `turn` after every event.
 4. Decide whether round 4 ending is allowed for this product phase. If not, remove or gate `allowEnding` before turn 5.
 5. Ensure stuck paths always emit either `turn_complete`, a recoverable error, or a visible text-only fallback.
 6. Confirm stale generation events cannot end a newer or still-running game.
 7. For turn-2 and turn-3 stuck cases, inspect whether the failure happens before ASR result, after ASR result, during LLM stream, during TTS background work, or during frontend phase reset.
-8. Annotate the 2026-07-05 evening recording before using it as pass/fail evidence.
+8. For final-turn completion, inspect whether `game_over` should be rendered only after the final audio queue is drained.
 
 ## Proposed Issue Drafts
 
@@ -255,20 +266,20 @@ Acceptance criteria:
 - The app does not remain indefinitely in a stuck recording/transcribing/narrating state.
 - The UI exposes enough status to tell whether it is waiting on ASR, LLM, TTS, reconnect, or fallback.
 
-### Issue C: Classify 2026-07-05 evening recording
+### Issue C: Ending card appears before final turn voice finishes
 
-Priority: P2 until annotated
+Priority: P1
 
 Evidence: `/Users/crystalchang/Desktop/螢幕錄影 2026-07-05 晚上9.24.01.mov`
 
 Summary:
-A large evening recording exists and has been preserved as evidence, but its observed behavior has not been annotated yet.
+The session can reach turn 5, but the ending card appears before the final spoken story finishes. The logical game completion and the voice-drama payoff are out of sync.
 
 Acceptance criteria:
 
-- Recording is reviewed or Crystal provides a short behavior label.
-- The evidence is routed into the correct existing bug line or marked as pass.
-- No claim is made from this file until annotation is complete.
+- Final-turn narration is allowed to land before the ending card takes over the screen.
+- `game_over` presentation is sequenced after final audio playback or represented with a clear final narration state.
+- The ending card does not interrupt the fifth-turn story voice.
 
 ## Custody Notes
 
@@ -276,5 +287,5 @@ Acceptance criteria:
 - Do not modify the video files.
 - Do not mark the 2026-07-04 test as pass.
 - Do not mark the 2026-07-05 turn-2 stuck test as pass.
-- Do not classify the 2026-07-05 evening recording until annotated.
+- Do not treat the 2026-07-05 evening recording as a clean pass, because final-turn voice/card sequencing still failed.
 - This triage note is for bug routing and project memory, not final root-cause analysis.
