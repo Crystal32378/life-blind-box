@@ -119,13 +119,18 @@ fi
 # Check /health (via socket path — Caddy proxies /?XTransformPort=3003)
 echo ""
 echo "=== /health check ==="
-# voice-game /health is at http://localhost:3003/health but socket.io uses path=/
-# Try direct curl
+# NOTE: socket.io uses path=/ which intercepts /health on port 3003.
+# The /health endpoint is for future use when socket.io path is changed.
+# For now, verify commit via the connected event (Crystal sees it in UI badge).
 HEALTH=$(curl -s --max-time 3 "http://localhost:3003/health" 2>/dev/null || echo "FAILED")
-if [ "$HEALTH" = "FAILED" ] || [ -z "$HEALTH" ]; then
-  echo "⚠️  /health not reachable (socket.io path=/ may intercept)"
-  echo "    This is expected if socket.io uses path=/ on port 3003"
+if echo "$HEALTH" | grep -q "Transport unknown"; then
+  echo "ℹ️  /health intercepted by socket.io (path=/) — expected"
+  echo "    Crystal verifies commit via UI badge (QA · <sha> · mode)"
+  echo "    Server 'connected' event includes commitHash + env"
+elif [ "$HEALTH" = "FAILED" ] || [ -z "$HEALTH" ]; then
+  echo "⚠️  /health not reachable"
 else
+  echo "✅ /health response:"
   echo "$HEALTH" | python3 -m json.tool 2>/dev/null || echo "$HEALTH"
 fi
 
