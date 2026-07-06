@@ -149,6 +149,17 @@ export default function VoiceGamePage() {
   // P0-postgame-fix: flag to discard late audio_chunk after game_over
   // Set true on game_over, reset false on start_game / generation_start
   const gameEndedRef = useRef<boolean>(false)
+  // Bug E fix: pending game_over — wait for audio to drain before showing ending card
+  const pendingGameOverRef = useRef<{
+    sessionId?: string
+    turnId?: number
+    generationId?: string
+    ending?: string
+    meta?: EndingMeta
+  } | null>(null)
+  const endingRevealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Bug E fix: ref to reveal function (avoids circular dependency with tryPlayNext)
+  const revealEndingRef = useRef<(() => void)>(() => {})
 
   // Helper: update both phase state and ref
   const setPhaseSafe = useCallback((p: Phase) => {
@@ -215,6 +226,9 @@ export default function VoiceGamePage() {
       }
     } finally {
       playLoopRunningRef.current = false
+      // Bug E fix: after audio loop ends, check if we should reveal pending ending
+      // This catches the case where last audio chunk finishes after game_over was received
+      revealEndingRef.current()
     }
   }, [muted])
 
@@ -260,6 +274,55 @@ export default function VoiceGamePage() {
       const resolver = interruptResolverRef.current
       interruptResolverRef.current = null
       resolver()
+    }
+  }, [])
+
+  // Bug E fix: check if audio has drained, then reveal ending card
+  const revealPendingGameOverWhenAudioDrained = useCallback(() => {
+    if (!pendingGameOverRef.current) return
+
+    const audioDrained =
+      audioQueueRef.current.size === 0 &&
+      isPlayingRef.current === false &&
+      playLoopRunningRef.current === false &&
+      currentlyPlayingSeqRef.current === null
+
+    if (!audioDrained) {
+      // Audio still playing or queued — check again in 200ms
+      if (endingRevealTimerRef.current) clearTimeout(endingRevealTimerRef.current)
+      endingRevealTimerRef.current = setTimeout(() => {
+        revealEndingRef.current()
+      }, 200)
+      return
+    }
+
+    // Audio drained — wait 400ms for natural pause, then reveal ending card
+    console.log('[ending-timing] audio drained, revealing ending card in 400ms')
+    if (endingRevealTimerRef.current) clearTimeout(endingRevealTimerRef.current)
+    endingRevealTimerRef.current = setTimeout(() => {
+      const pending = pendingGameOverRef.current
+      if (!pending) return
+
+      // NOW reveal ending card
+      gameEndedRef.current = true
+      interruptPlayback()  // clear any residual
+      if (pending.meta) setEndingMeta(pending.meta)
+      setPhaseSafe('ended')
+      pendingGameOverRef.current = null
+      endingRevealTimerRef.current = null
+      console.log(`[ending-timing] ending card revealed (ending=${pending.ending || 'auto'})`)
+    }, 400)
+  }, [interruptPlayback, setPhaseSafe])
+
+  // Bug E fix: keep ref updated so tryPlayNext can call it without circular dependency
+  revealEndingRef.current = revealPendingGameOverWhenAudioDrained
+
+  // Bug E fix: clear pending game over (called on reset / new game / generation_start)
+  const clearPendingGameOver = useCallback(() => {
+    pendingGameOverRef.current = null
+    if (endingRevealTimerRef.current) {
+      clearTimeout(endingRevealTimerRef.current)
+      endingRevealTimerRef.current = null
     }
   }, [])
 
@@ -387,6 +450,8 @@ export default function VoiceGamePage() {
       interruptPlayback()
       // P0-postgame-fix: new generation means game is in progress, clear ended flag
       gameEndedRef.current = false
+      // Bug E fix: clear any pending ending from previous turn
+      clearPendingGameOver()
       currentGenerationIdRef.current = data.generationId
       if (typeof data.turnId === 'number') currentTurnIdRef.current = data.turnId
     })
@@ -445,15 +510,11 @@ export default function VoiceGamePage() {
         console.debug(`[discard game_over] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
         return
       }
-      // P0-postgame-fix: mark game ended + stop any in-flight audio
-      // Late audio_chunk from server's pending TTS promises will be discarded by handleAudioChunk
-      gameEndedRef.current = true
-      interruptPlayback()
-      console.log(`[game_over] ending=${data.ending || 'auto'}, audio queue cleared, late audio will be discarded`)
-      if (data?.meta) {
-        setEndingMeta(data.meta)
-      }
-      setPhaseSafe('ended')
+      // Bug E fix: don't immediately show ending card — wait for audio to drain
+      // Store as pending, let revealPendingGameOverWhenAudioDrained handle timing
+      pendingGameOverRef.current = data
+      console.log(`[game_over] pending ending=${data.ending || 'auto'}, waiting for audio to drain`)
+      revealPendingGameOverWhenAudioDrained()
     })
 
     socket.on('status', (data: { stage: string; generationId?: string }) => {
@@ -502,6 +563,8 @@ export default function VoiceGamePage() {
       setPhaseSafe('idle')
       setError(null)
       interruptPlayback()
+      // Bug E fix: clear any pending ending
+      clearPendingGameOver()
     })
 
     return () => {
@@ -652,12 +715,14 @@ export default function VoiceGamePage() {
     nextPlaySeqRef.current = 0
     // P0-postgame-fix: new game starting, clear ended flag so audio plays normally
     gameEndedRef.current = false
+    // Bug E fix: clear any pending ending
+    clearPendingGameOver()
     setPhaseSafe('narrating')
     // 開局時 increment
     const newCount = incrementDailyCount()
     setDailyCount(newCount)
     socketRef.current?.emit('start_game', category ? { category } : {})
-  }, [interruptPlayback, setPhaseSafe, userMode, serverQuota])
+  }, [interruptPlayback, setPhaseSafe, userMode, serverQuota, clearPendingGameOver])
 
   const resetGame = useCallback(() => {
     interruptPlayback()
@@ -665,8 +730,10 @@ export default function VoiceGamePage() {
     setSceneTemplate(null)
     setTtsMode('voice')
     setTtsModeReason('')
+    // Bug E fix: clear any pending ending
+    clearPendingGameOver()
     socketRef.current?.emit('reset_game')
-  }, [interruptPlayback])
+  }, [interruptPlayback, clearPendingGameOver])
 
   // ============ Share helpers ============
   const buildShareText = useCallback(() => {
