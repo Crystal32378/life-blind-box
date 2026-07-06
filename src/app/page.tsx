@@ -882,8 +882,11 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
             </span>
           )}
           {serverCommitHash && (
-            <span className="text-xs tracking-widest text-blue-300 bg-blue-950/40 border border-blue-800/50 px-2 py-0.5 rounded-full" title={`env: ${serverEnv}`}>
-              QA · {serverCommitHash.slice(0,7)} · {userMode}
+            <span
+              className="text-xs tracking-widest text-emerald-300 bg-emerald-950/40 border border-emerald-800/50 px-2 py-0.5 rounded-full"
+              title={`frontend: ${process.env.NEXT_PUBLIC_COMMIT_HASH?.slice(0,7) || '?'}\nvoice-game: ${serverCommitHash.slice(0,7)}\nprovider: openai\nenv: ${serverEnv || 'unknown'}`}
+            >
+              QA READY · {userMode} · OpenAI
             </span>
           )}
           <span className={`text-xs tracking-widest ${remainingToday === 0 ? 'text-red-400' : remainingToday === 1 ? 'text-amber-400' : 'text-zinc-500'}`}>
