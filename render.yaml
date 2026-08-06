@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: life-blind-box
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: bun install --frozen-lockfile && bun run build
+    startCommand: bun run start
+    envVars:
+      - key: NEXT_PUBLIC_VOICE_GAME_URL
+        value: https://life-blind-box-voice.onrender.com
+
+  - type: web
+    name: life-blind-box-voice
+    runtime: node
+    plan: free
+    region: singapore
+    rootDir: mini-services/voice-game
+    buildCommand: bun install --frozen-lockfile
+    startCommand: bun run start
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: openai
+      - key: ASR_PROVIDER
+        value: openai
+      - key: TTS_PROVIDER
+        value: openai
+      - key: OPENAI_LLM_MODEL
+        value: gpt-4o-mini
+      - key: OPENAI_ASR_MODEL
+        value: gpt-4o-mini-transcribe
+      - key: OPENAI_TTS_MODEL
+        value: gpt-4o-mini-tts
+      - key: OPENAI_TTS_VOICE
+        value: fable
+      - key: OPENAI_TTS_RESPONSE_FORMAT
+        value: wav
+      - key: CORS_ORIGIN
+        value: https://life-blind-box.onrender.com
+      - key: QA_ENV
+        value: render

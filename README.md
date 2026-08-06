@@ -21,24 +21,17 @@
 - socket.io-client (WebSocket connection to voice-game service)
 
 **Backend (voice-game mini-service)**
-- Bun runtime + socket.io server (port 3003)
-- OpenAI SDK (chat.completions streaming)
-- z-ai-web-dev-sdk (TTS / ASR)
+- Bun runtime + socket.io server (`PORT`, local default 3003)
+- OpenAI SDK for LLM streaming, speech-to-text, and text-to-speech
 
-**AI models (current)**
-- LLM: `glm-4-plus` (via Z.ai internal gateway, OpenAI-compatible API)
-- STT: Z.ai ASR (Whisper-style)
-- TTS: Z.ai TTS (voice: `tongtong`)
-
-> The voice-game service uses OpenAI SDK pointed at the Z.ai internal gateway
-> (`internal-api.z.ai/v1`) configured in `/etc/.z-ai-config`. This avoids
-> OpenAI's region block on HK and gives us GLM-4-plus with OpenAI-compatible
-> streaming. TTS/ASR still go through the Z.ai SDK because their API shape
-> differs slightly from OpenAI's.
+**AI models (Render default)**
+- LLM: `gpt-4o-mini`
+- STT: `gpt-4o-mini-transcribe`
+- TTS: `gpt-4o-mini-tts` (voice: `fable`)
 
 **Infrastructure**
-- Caddy gateway (port 81 → routes to Next.js 3000 and voice-game 3003 via `?XTransformPort=` query)
-- SQLite + Prisma (currently unused, reserved for future user data)
+- Two Render web services: Next.js frontend + public Socket.IO voice service
+- In-memory game state; no database is required
 
 ---
 
@@ -73,35 +66,48 @@ life-blind-box/
 
 ---
 
-## Quick Start (in the Z.ai sandbox)
+## Quick Start
 
-The sandbox already has:
-- Next.js dev server running on port 3000
-- Caddy gateway on port 81
-- Z.ai config at `/etc/.z-ai-config`
-
-You only need to start the voice-game service:
+Start the voice service with server-side OpenAI configuration:
 
 ```bash
 cd mini-services/voice-game
 bun install
-bun run dev
-# → voice-game service on port 3003
+OPENAI_API_KEY=... bun run dev
 ```
 
-Then open the app via the Caddy gateway (port 81), not localhost:3000 directly,
-because socket.io needs `?XTransformPort=3003` to route through Caddy.
+Then start the frontend from the repo root. Its local fallback connects to
+`http://localhost:3003`; set `NEXT_PUBLIC_VOICE_GAME_URL` to override it.
 
-### Quick Start (outside the sandbox)
+```bash
+bun install
+bun run dev
+```
 
-1. Clone the repo
-2. `bun install` in both root and `mini-services/voice-game/`
-3. Create `.env.local` (root) and `mini-services/voice-game/.env` based on `.env.example`
-4. Set up an OpenAI-compatible gateway (the sandbox uses `internal-api.z.ai/v1`;
-   you can use OpenAI directly, Azure OpenAI, or any OpenAI-compatible endpoint)
-5. Start voice-game service: `cd mini-services/voice-game && bun run dev`
-6. Start Next.js: `bun run dev`
-7. Open http://localhost:3000
+## Render deployment
+
+The repository includes [`render.yaml`](./render.yaml). Existing services can
+also be configured manually with these equivalent settings:
+
+| Service | Root directory | Build command | Start command | Health check |
+|---|---|---|---|---|
+| `life-blind-box` | repository root | `bun install --frozen-lockfile && bun run build` | `bun run start` | `/` |
+| `life-blind-box-voice` | `mini-services/voice-game` | `bun install --frozen-lockfile` | `bun run start` | `/health` |
+
+Frontend build-time environment:
+
+- `NEXT_PUBLIC_VOICE_GAME_URL=https://life-blind-box-voice.onrender.com`
+
+Voice service environment:
+
+- `OPENAI_API_KEY` (secret; set only in Render)
+- `LLM_PROVIDER=openai`
+- `ASR_PROVIDER=openai`
+- `TTS_PROVIDER=openai`
+- `CORS_ORIGIN=https://life-blind-box.onrender.com`
+
+Render injects `PORT`; the service reads it automatically. The API key must
+never be prefixed with `NEXT_PUBLIC_` or committed to the repository.
 
 ---
 
@@ -111,11 +117,11 @@ See [`.env.example`](./.env.example) for the full list. Summary:
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `OPENAI_API_KEY` | voice-game | OpenAI API key (only if calling OpenAI directly) |
+| `OPENAI_API_KEY` | voice-game | Required server-side OpenAI API key |
 | `OPENAI_LLM_MODEL` | voice-game | LLM model name (default `gpt-4o-mini`) |
-| `LLM_MODEL` | voice-game | Override LLM model when using Z.ai gateway (default `glm-4-plus`) |
-| `TTS_VOICE` | voice-game | TTS voice (default `tongtong`) |
-| `DATABASE_URL` | Next.js | SQLite path for Prisma (currently unused) |
+| `OPENAI_ASR_MODEL` | voice-game | STT model (default `gpt-4o-mini-transcribe`) |
+| `OPENAI_TTS_MODEL` | voice-game | TTS model (default `gpt-4o-mini-tts`) |
+| `NEXT_PUBLIC_VOICE_GAME_URL` | Next.js | Public origin of the Socket.IO voice service |
 
 ---
 

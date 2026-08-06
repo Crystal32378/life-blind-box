@@ -2,13 +2,16 @@ import { createServer } from 'http'
 import { Server } from 'socket.io'
 import { randomUUID } from 'crypto'
 import { openai, getZAI, LLM_MODEL, TTS_VOICE } from './openai-client'
-import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, EndingMeta } from './prompt'
+import { SYSTEM_PROMPT, splitIntoSentences, detectEnding, isEnteringEndingBlock, extractPreEndingText, FALLBACK_ENDING_META, EndingMeta } from './prompt'
 import { pickRandomTemplate, pickTemplateByCategory, templateToOpeningPrompt, SceneTemplate, CATEGORY_NAMES, SceneCategory, SCENE_TEMPLATES } from './scene-templates'
 import { usageLogger, logUsage, UsageLogger } from './usage-logger'
-import { QuotaChecker } from './quota'
+import { QuotaChecker, UserMode } from './quota'
 import { checkContentSafety, checkLLMOutput, checkUserInput, SAFETY_FALLBACK_NARRATION } from './safety'
 import { TTSCircuitBreaker } from './tts-circuit-breaker'
+import { ASRCircuitBreaker } from './asr-circuit-breaker'
 import { textToSpeechOpenAI, isOpenAIConfigured } from './openai-tts'
+import { streamLLMViaOpenAI, isOpenAILLMConfigured } from './openai-llm'
+import { speechToTextOpenAI, isOpenAIASRConfigured } from './openai-asr'
 
 // ====== Types ======
 interface GameState {
@@ -19,6 +22,8 @@ interface GameState {
   template?: SceneTemplate  // 這一局抽到的場景模板
   currentGenerationId: string  // 當前有效的 generation（用來 discard 舊事件）
   anonUserId: string  // 匿名用戶 ID（IP hash）
+  founderToken?: string  // P0-3: founder token (never logged, never sent to frontend)
+  userMode: UserMode  // P0-3: 'founder' | 'public'
 }
 
 interface PendingTTS {
@@ -27,11 +32,31 @@ interface PendingTTS {
 }
 
 // ====== Globals ======
-const PORT = 3003
+const PORT = Number(process.env.PORT || 3003)
 const MAX_TURNS = 5
 const games = new Map<string, GameState>() // socket.id -> game state
+const corsOrigins = (process.env.CORS_ORIGIN || 'http://localhost:3000')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean)
+
+// P0-1: narrative error copy (no technical jargon, per 大G)
+const NARRATIVE_ERRORS = [
+  '這段人生剛剛沒有聽清楚，請再說一次。',
+  '命運線路短暫打結，請重新敲門。',
+  '訊號在時空裂縫中迷路了，再試一次吧。',
+  '這段對話被風吹散了，請重說一次。',
+]
+function pickNarrativeError(): string {
+  return NARRATIVE_ERRORS[Math.floor(Math.random() * NARRATIVE_ERRORS.length)]
+}
 
 // ====== HTTP + Socket.io server ======
+// QA-anchored /health: commit hash + env so Crystal can verify running code = disk code
+const COMMIT_HASH = process.env.COMMIT_HASH || 'unknown'
+const QA_ENV = process.env.QA_ENV || 'sandbox-qa'
+const startTime = Date.now()
+
 const httpServer = createServer((req, res) => {
   // P1: monitor endpoint for circuit breaker status
   if (req.url === '/health') {
@@ -39,21 +64,27 @@ const httpServer = createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({
       ok: true,
+      env: QA_ENV,
+      commit: COMMIT_HASH,
+      uptime_ms: Date.now() - startTime,
+      llm_provider: LLM_PROVIDER,
+      asr_provider: ASR_PROVIDER,
       tts_provider: TTS_PROVIDER,
       openai_configured: isOpenAIConfigured(),
+      openai_llm_configured: isOpenAILLMConfigured(),
+      openai_asr_configured: isOpenAIASRConfigured(),
       circuit_breaker: breakerStatus,
-      uptime_ms: Date.now() - startTime,
+      asr_circuit_breaker: ASRCircuitBreaker.getStatus(),
+      founder_mode_enabled: QuotaChecker.isFounderModeEnabled(),
     }))
     return
   }
   res.writeHead(404)
   res.end('Not Found')
 })
-const startTime = Date.now()
 
 const io = new Server(httpServer, {
-  path: '/',
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+  cors: { origin: corsOrigins, methods: ['GET', 'POST'] },
   pingTimeout: 60000,
   pingInterval: 25000,
   maxHttpBufferSize: 10 * 1024 * 1024, // 10 MB for audio blobs
@@ -145,6 +176,9 @@ function extractDelta(data: string): string {
 /**
  * 串流呼叫 LLM (via OpenAI SDK + z.ai gateway → GLM-4-plus)。
  */
+// ====== LLM provider config ======
+const LLM_PROVIDER = process.env.LLM_PROVIDER || 'openai'  // 'zai' | 'openai' | 'auto'
+
 async function streamLLM(
   messages: Array<{ role: string; content: string }>,
   onText: (chunk: string) => void,
@@ -152,34 +186,63 @@ async function streamLLM(
 ): Promise<string> {
   let fullText = ''
   const t0 = Date.now()
-  console.log(`[LLM] starting stream, model=${LLM_MODEL}, messages=${messages.length}`)
 
-  // z.ai gateway 接受原本的 messages 格式（role: 'assistant' for system prompt 也 OK）
-  const stream = await openai.chat.completions.create({
-    model: LLM_MODEL,
-    messages: messages as any,
-    stream: true,
-    temperature: 0.9,
-  }, { signal: abortSignal })
-  console.log(`[LLM] stream returned after ${Date.now() - t0}ms`)
-
-  let chunkCount = 0
-  for await (const part of stream) {
-    if (abortSignal?.aborted) break
-    chunkCount++
-    const delta = part?.choices?.[0]?.delta?.content || ''
-    if (delta) {
-      fullText += delta
-      onText(delta)
+  // ====== LLM_PROVIDER=openai: 只用 OpenAI ======
+  if (LLM_PROVIDER === 'openai') {
+    if (!isOpenAILLMConfigured()) {
+      throw new Error('LLM_PROVIDER=openai but OPENAI_API_KEY not set')
     }
+    console.log(`[LLM] provider=openai, messages=${messages.length}`)
+    fullText = await streamLLMViaOpenAI(messages, onText, abortSignal)
+    console.log(`[LLM] openai stream ended after ${Date.now() - t0}ms, textLen=${fullText.length}`)
+    return fullText
   }
-  console.log(`[LLM] stream ended after ${Date.now() - t0}ms, chunks=${chunkCount}, textLen=${fullText.length}`)
 
-  return fullText
+  // ====== LLM_PROVIDER=zai or auto: 先 z.ai，429 → fallback OpenAI ======
+  console.log(`[LLM] provider=${LLM_PROVIDER} primary=zai, model=${LLM_MODEL}, messages=${messages.length}`)
+
+  try {
+    const stream = await openai.chat.completions.create({
+      model: LLM_MODEL,
+      messages: messages as any,
+      stream: true,
+      temperature: 0.9,
+    }, { signal: abortSignal })
+    console.log(`[LLM] stream returned after ${Date.now() - t0}ms`)
+
+    let chunkCount = 0
+    for await (const part of stream) {
+      if (abortSignal?.aborted) break
+      chunkCount++
+      const delta = part?.choices?.[0]?.delta?.content || ''
+      if (delta) {
+        fullText += delta
+        onText(delta)
+      }
+    }
+    console.log(`[LLM] stream ended after ${Date.now() - t0}ms, chunks=${chunkCount}, textLen=${fullText.length}`)
+    return fullText
+  } catch (err: any) {
+    const msg = String(err?.message || err)
+    const is429 = msg.includes('429') || msg.includes('Too many requests')
+
+    // auto mode: z.ai 429 → fallback OpenAI
+    if (LLM_PROVIDER === 'auto' && is429 && isOpenAILLMConfigured()) {
+      console.warn(`[LLM] z.ai 429, falling back to OpenAI: ${msg.slice(0, 100)}`)
+      try {
+        fullText = await streamLLMViaOpenAI(messages, onText, abortSignal)
+        console.log(`[LLM] OpenAI fallback succeeded, textLen=${fullText.length}`)
+        return fullText
+      } catch (openaiErr: any) {
+        console.error(`[LLM] OpenAI fallback also failed:`, String(openaiErr?.message || openaiErr).slice(0, 100))
+      }
+    }
+    throw err
+  }
 }
 
 // ====== TTS provider config ======
-const TTS_PROVIDER = process.env.TTS_PROVIDER || 'auto'  // 'zai' | 'openai' | 'auto'
+const TTS_PROVIDER = process.env.TTS_PROVIDER || 'openai'  // 'zai' | 'openai' | 'auto'
 
 /**
  * Z.ai TTS（原本的 provider）
@@ -308,31 +371,128 @@ async function textToSpeechWav(text: string, sessionId: string): Promise<TTSResu
   throw new Error(`Unknown TTS_PROVIDER: ${TTS_PROVIDER}`)
 }
 
+// ====== ASR provider config ======
+const ASR_PROVIDER = process.env.ASR_PROVIDER || 'openai'  // 'zai' | 'openai' | 'auto'
+
+if (
+  [LLM_PROVIDER, ASR_PROVIDER, TTS_PROVIDER].includes('openai') &&
+  !process.env.OPENAI_API_KEY
+) {
+  throw new Error('OPENAI_API_KEY is required when an OpenAI provider is enabled')
+}
+
 /**
- * STT：base64 音訊 -> 文字 (via z.ai ASR)。
+ * STT：base64 音訊 -> 文字。
+ * 根據 ASR_PROVIDER 決定用哪個 provider：
+ * - 'zai': 只用 Z.ai ASR
+ * - 'openai': 只用 OpenAI ASR (gpt-4o-mini-transcribe)
+ * - 'auto': 先 Z.ai，429 失敗 → fallback OpenAI
+ *
  * 失敗時指數 backoff 重試 3 次。
+ * ASR 429 時記錄到 ASRCircuitBreaker。
  */
-async function speechToText(base64Audio: string, _mimeType: string = 'audio/webm'): Promise<string> {
+async function speechToText(base64Audio: string, mimeType: string = 'audio/webm', sessionId?: string): Promise<string> {
+  let lastErr: any = null
+  let retryCount = 0
+
+  // ====== ASR_PROVIDER=openai: 只用 OpenAI ======
+  if (ASR_PROVIDER === 'openai') {
+    if (!isOpenAIASRConfigured()) {
+      throw new Error('ASR_PROVIDER=openai but OPENAI_API_KEY not set')
+    }
+    try {
+      const text = await speechToTextOpenAI(base64Audio, mimeType)
+      if (sessionId) ASRCircuitBreaker.recordSuccess(sessionId)
+      console.log(`[ASR] provider=openai model=${process.env.OPENAI_ASR_MODEL || 'gpt-4o-mini-transcribe'} text="${text}"`)
+      return text
+    } catch (err: any) {
+      const msg = String(err?.message || err)
+      console.error(`[ASR openai error]`, msg.slice(0, 200))
+      const is429 = msg.includes('429') || msg.includes('Too many requests')
+      if (is429 && sessionId) ASRCircuitBreaker.record429(sessionId)
+      ;(err as any).asrRetryCount = 0
+      ;(err as any).asrRateLimited = is429
+      throw err
+    }
+  }
+
+  // ====== ASR_PROVIDER=zai: 只用 Z.ai (original logic) ======
+  if (ASR_PROVIDER === 'zai') {
+    return speechToTextZai(base64Audio, mimeType, sessionId)
+  }
+
+  // ====== ASR_PROVIDER=auto: 先 Z.ai，429 → fallback OpenAI ======
+  if (ASR_PROVIDER === 'auto') {
+    try {
+      return await speechToTextZai(base64Audio, mimeType, sessionId)
+    } catch (err: any) {
+      const msg = String(err?.message || err)
+      const is429 = msg.includes('429') || msg.includes('Too many requests')
+      console.warn(`[ASR] Z.ai failed (${is429 ? '429' : 'other'}): ${msg.slice(0, 100)}`)
+
+      if (is429 && isOpenAIASRConfigured()) {
+        console.log('[ASR] falling back to OpenAI ASR')
+        try {
+          const text = await speechToTextOpenAI(base64Audio, mimeType)
+          if (sessionId) ASRCircuitBreaker.recordSuccess(sessionId)
+          console.log(`[ASR] OpenAI fallback succeeded: text="${text}"`)
+          return text
+        } catch (openaiErr: any) {
+          console.error(`[ASR] OpenAI fallback also failed:`, String(openaiErr?.message || openaiErr).slice(0, 100))
+          throw openaiErr
+        }
+      }
+      throw err
+    }
+  }
+
+  throw new Error(`Unknown ASR_PROVIDER: ${ASR_PROVIDER}`)
+}
+
+/**
+ * Z.ai ASR (original speechToText logic, extracted)
+ */
+async function speechToTextZai(base64Audio: string, _mimeType: string = 'audio/webm', sessionId?: string): Promise<string> {
   const zai = await getZAI()
   let lastErr: any = null
+  let retryCount = 0
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const response = await zai.audio.asr.create({
         file_base64: base64Audio,
       })
+      if (sessionId) ASRCircuitBreaker.recordSuccess(sessionId)
       return response.text || ''
     } catch (err: any) {
       lastErr = err
       const msg = String(err?.message || err)
-      console.error(`[ASR error attempt ${attempt + 1}]`, msg.slice(0, 200))
-      if (msg.includes('429') || msg.includes('Too many requests') || msg.includes('5')) {
-        const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
-        console.log(`[ASR retry] attempt=${attempt + 1} backoff=${backoff}ms`)
-        await new Promise(r => setTimeout(r, backoff))
-        continue
+      const is429 = msg.includes('429') || msg.includes('Too many requests')
+      console.error(`[ASR zai error attempt ${attempt + 1}]`, msg.slice(0, 200))
+
+      if (is429) {
+        if (sessionId) ASRCircuitBreaker.record429(sessionId)
+        retryCount++
+        if (attempt < 2) {
+          const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
+          console.log(`[ASR zai retry] attempt=${attempt + 1} backoff=${backoff}ms`)
+          await new Promise(r => setTimeout(r, backoff))
+          continue
+        }
+      } else if (msg.includes('5')) {
+        retryCount++
+        if (attempt < 2) {
+          const backoff = Math.min(8000, 1500 * Math.pow(2, attempt))
+          console.log(`[ASR zai retry] attempt=${attempt + 1} backoff=${backoff}ms (5xx)`)
+          await new Promise(r => setTimeout(r, backoff))
+          continue
+        }
       }
       throw err
     }
+  }
+  if (lastErr) {
+    ;(lastErr as any).asrRetryCount = retryCount
+    ;(lastErr as any).asrRateLimited = true
   }
   throw lastErr
 }
@@ -375,11 +535,14 @@ async function streamNarration(
   abortSignal?: AbortSignal,
   onLLMDone?: () => void,
   ids?: { sessionId: string; turnId: number; generationId: string; anonUserId?: string },
+  onFirstTextChunk?: () => void,  // P0-0: fires when first text_chunk is emitted (for quota charge decision)
+  suppressEnding?: boolean,  // hard-gated C: if true, treat [[END]]/META: as normal text, don't enter ending block
 ): Promise<{ fullText: string; isEnding: boolean; meta?: EndingMeta }> {
   const sessionId = ids?.sessionId || ''
   const turnId = ids?.turnId ?? 0
   const generationId = ids?.generationId || ''
   const anonUserId = ids?.anonUserId || ''
+  const shouldSuppressEnding = suppressEnding === true  // hard-gated C
 
   let buffer = ''
   let fullText = ''
@@ -387,6 +550,10 @@ async function streamNarration(
   let isEnding = false
   let endingMeta: EndingMeta | undefined
   let retryCount = 0
+
+  // P0-ending-fix: once we see [[END]] or META: in fullText, enter metadata buffering mode
+  // — stop emitting text_chunk / audio_chunk, just accumulate fullText for final parse
+  let endingBlockStarted = false
 
   // 並行 TTS：每個 sentence 起一個 Promise，完成後 emit。
   const ttsPromises: Promise<void>[] = []
@@ -399,6 +566,13 @@ async function streamNarration(
   const flushSentence = (sentence: string) => {
     const trimmed = sentence.trim()
     if (!trimmed) return
+
+    // P0-ending-fix: if we've entered ending block, don't emit this sentence as text/TTS
+    // (it's either META JSON or ending marker text — should not be shown or spoken)
+    if (endingBlockStarted) {
+      console.debug(`[ending-buffer] suppressing sentence in ending block: "${trimmed.slice(0, 40)}..."`)
+      return
+    }
 
     const { content, isEnding: ending, meta } = detectEnding(trimmed)
     if (ending) {
@@ -436,6 +610,8 @@ async function streamNarration(
       seq: currentSeq,
       text: finalSentence,
     })
+    // P0-0: notify caller that at least one playable response was sent
+    onFirstTextChunk?.()
 
     // 並行發起 TTS，但 semaphore 限制並行 + 節流
     const p = (async () => {
@@ -519,6 +695,46 @@ async function streamNarration(
       if (!llmFirstTokenMs) llmFirstTokenMs = Date.now() - turnStart
       buffer += delta
       fullText += delta
+
+      // P0-ending-fix: check if we just entered the ending block ([[END]] or META:)
+      // Once entered, stop flushing sentences as text/TTS — buffer everything for final parse
+      // hard-gated C: if shouldSuppressEnding (turn < 5/5), DON'T enter ending block
+      // — strip [[END]]/META: from buffer and continue normal flushing
+      if (!shouldSuppressEnding && !endingBlockStarted && isEnteringEndingBlock(fullText)) {
+        endingBlockStarted = true
+        console.log(`[ending-buffer] entering ending block, suppressing further text/TTS emit`)
+        // Flush any pre-ending text that's still in buffer (劇情文字 before [[END]])
+        const preEnding = extractPreEndingText(buffer)
+        if (preEnding.trim()) {
+          // Re-split the pre-ending part and flush those sentences
+          const preSentences = splitIntoSentences(preEnding)
+          for (const s of preSentences) {
+            flushSentence(s)
+          }
+        }
+        buffer = ''  // clear buffer, don't flush ending markers as text
+        return
+      }
+
+      // hard-gated C: if shouldSuppressEnding, strip [[END]]/META: from buffer so they
+      // don't leak as text/TTS, but continue normal sentence flushing for 劇情文字
+      if (shouldSuppressEnding) {
+        // Remove [[END]] and META:... from buffer
+        const cleanedBuffer = buffer
+          .replace(/\[\[END\]\]/g, '')
+          .replace(/META:\s*\{[\s\S]*$/g, '')
+          .replace(/META:\s*\{[^}]*\}/g, '')
+        if (cleanedBuffer !== buffer) {
+          console.debug(`[ending-suppress-stream] stripped ending markers from buffer`)
+          buffer = cleanedBuffer
+        }
+      }
+
+      // If already in ending block, just accumulate fullText, don't flush
+      if (endingBlockStarted) {
+        return
+      }
+
       // 嘗試切出完整句
       const sentences = splitIntoSentences(buffer)
       if (sentences.length > 1) {
@@ -533,8 +749,34 @@ async function streamNarration(
   )
 
   // 收尾：剩下的 buffer 也送 TTS
-  if (buffer.trim()) {
+  // P0-ending-fix: if in ending block, don't flush buffer (it's ending markers/META)
+  // hard-gated C: if shouldSuppressEnding, buffer has already been stripped of ending markers,
+  // so safe to flush remaining 劇情文字
+  if (!endingBlockStarted && buffer.trim()) {
     flushSentence(buffer)
+  }
+
+  // P0-ending-fix: if we entered ending block, parse the full text for ending/meta
+  // hard-gated C: if shouldSuppressEnding, we never entered ending block, so isEnding stays false
+  if (endingBlockStarted && !shouldSuppressEnding) {
+    const { isEnding: detectedEnding, meta: detectedMeta } = detectEnding(fullText)
+    if (detectedEnding) {
+      isEnding = true
+      endingMeta = detectedMeta || FALLBACK_ENDING_META
+      console.log(`[ending-buffer] final parse: isEnding=true, meta title="${endingMeta?.title}"`)
+    } else {
+      // Saw [[END]] or META: but detectEnding didn't confirm? Use fallback.
+      isEnding = true
+      endingMeta = FALLBACK_ENDING_META
+      console.warn(`[ending-buffer] ending block started but detectEnding didn't confirm, using fallback`)
+    }
+  }
+
+  // hard-gated C: if shouldSuppressEnding, ensure isEnding=false (game continues to next turn)
+  if (shouldSuppressEnding && isEnding) {
+    console.warn(`[ending-suppress] LLM output ending but shouldSuppressEnding=true, forcing isEnding=false`)
+    isEnding = false
+    endingMeta = undefined
   }
 
   // LLM 結束，立刻通知（不等 TTS），讓前端可以早點切回 idle / 允許玩家搶話
@@ -573,6 +815,10 @@ io.on('connection', (socket) => {
   const rawIp = (socket.handshake as any)?.address || socket.id
   const anonUserId = UsageLogger.hashUserId(rawIp)
 
+  // P0-3: parse founder token from handshake auth (not from query string — avoid URL logging)
+  const founderToken = (socket.handshake as any)?.auth?.founderToken as string | undefined
+  const userMode: UserMode = QuotaChecker.isFounderTokenValid(founderToken) ? 'founder' : 'public'
+
   games.set(socket.id, {
     messages: [{ role: 'assistant', content: SYSTEM_PROMPT }],
     turnCount: 0,
@@ -580,14 +826,21 @@ io.on('connection', (socket) => {
     sessionId: socket.id,
     currentGenerationId: '',
     anonUserId,
+    founderToken: userMode === 'founder' ? founderToken : undefined,
+    userMode,
   })
 
-  // 連線成功 → 送 sessionId + 額度狀態
-  const quotaStatus = QuotaChecker.getStatus(anonUserId)
+  console.log(`[connect] ${socket.id} mode=${userMode}`)
+
+  // 連線成功 → 送 sessionId + 額度狀態 + userMode (P0-3)
+  const quotaStatus = QuotaChecker.getStatus(anonUserId, founderToken)
   socket.emit('connected', {
     sessionId: socket.id,
     anonUserId,
     quota: quotaStatus,
+    userMode,
+    commitHash: COMMIT_HASH,
+    env: QA_ENV,
   })
 
   // 列出所有可用類別（給前端顯示用）
@@ -610,10 +863,10 @@ io.on('connection', (socket) => {
       return
     }
 
-    // ====== P0-2: server-side quota check ======
-    const quotaCheck = QuotaChecker.checkCanStart(game.anonUserId)
+    // ====== P0-2: server-side quota check (P0-3: pass founderToken) ======
+    const quotaCheck = QuotaChecker.checkCanStart(game.anonUserId, game.founderToken)
     if (!quotaCheck.ok) {
-      console.warn(`[quota] start_game blocked: ${quotaCheck.reason}`)
+      console.warn(`[quota] start_game blocked: ${quotaCheck.reason} mode=${game.userMode}`)
       socket.emit('error_msg', {
         message: quotaCheck.reason === 'BETA_DISABLED'
           ? 'Beta 暫時關閉維護中，稍後再來。'
@@ -628,12 +881,13 @@ io.on('connection', (socket) => {
         event_type: 'quota_blocked',
         timestamp: new Date().toISOString(),
         error_code: quotaCheck.reason,
+        user_mode: game.userMode,
       })
       return
     }
 
-    // ====== 記錄開局 + 抽 template ======
-    QuotaChecker.recordStart(game.anonUserId)
+    // ====== 記錄開局 + 抽 template (P0-3: pass founderToken) ======
+    QuotaChecker.recordStart(game.anonUserId, game.founderToken)
     const category = payload?.category as SceneCategory | undefined
     const template = category ? pickTemplateByCategory(category) : pickRandomTemplate()
     game.template = template
@@ -642,7 +896,7 @@ io.on('connection', (socket) => {
     const turnId = 0  // 開場算 turn 0
     const generationId = game.currentGenerationId
 
-    console.log(`[start_game] ${socket.id} template=${template.id} gen=${generationId.slice(0,8)}`)
+    console.log(`[start_game] ${socket.id} template=${template.id} gen=${generationId.slice(0,8)} mode=${game.userMode}`)
 
     // 送 turn_start（帶 ID）
     socket.emit('turn_start', { sessionId: socket.id, turnId, generationId, turn: 0 })
@@ -668,7 +922,11 @@ io.on('connection', (socket) => {
       timestamp: new Date().toISOString(),
       category: template.category,
       template_id: template.id,
+      user_mode: game.userMode,
     })
+
+    // P0-0: track whether any playable response (text_chunk) was sent to the user
+    let playableResponseSent = false
 
     try {
       const trigger = templateToOpeningPrompt(template)
@@ -690,6 +948,7 @@ io.on('connection', (socket) => {
         undefined,  // abortSignal
         undefined,  // onLLMDone
         { sessionId: socket.id, turnId, generationId, anonUserId: game.anonUserId },
+        () => { playableResponseSent = true },  // P0-0: onFirstTextChunk
       )
 
       // 開場白永遠回傳 isEnding=false（帶 ID）
@@ -710,12 +969,22 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
         completed: true,
         extra: { turn_total_ms: Date.now() - turnStart },
+        user_mode: game.userMode,
       })
     } catch (err: any) {
       console.error('[start_game error]', err?.message || err)
+
+      // P0-0: refund quota if no playable response was sent (LLM/ASR failed before any text_chunk)
+      let quotaRefunded = false
+      if (!playableResponseSent) {
+        QuotaChecker.refundStart(game.anonUserId, game.founderToken)
+        quotaRefunded = true
+        console.log(`[quota] refunded start_game for ${socket.id} mode=${game.userMode} (no playable response)`)
+      }
+
       socket.emit('error_msg', {
         sessionId: socket.id, turnId, generationId,
-        message: '開場生成失敗，請重試',
+        message: pickNarrativeError(),  // P0-1: narrative error copy
         code: 'START_GAME_FAIL',
       })
       logUsage({
@@ -727,6 +996,8 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
         error_code: String(err?.code || err?.status || 'LLM_FAIL'),
         dropped: true,
+        user_mode: game.userMode,
+        quota_refunded: quotaRefunded,
       })
     }
   })
@@ -761,21 +1032,86 @@ io.on('connection', (socket) => {
     const generationId = randomUUID()
     game.currentGenerationId = generationId  // 這行之後，舊 generation 的 emit 前端會 discard
 
-    console.log(`[submit_audio] ${socket.id} gen=${generationId.slice(0,8)} bytes=${audioBytes} turn=${nextTurn}`)
+    // P0-1: emit generation_start BEFORE ASR, so frontend updates its generationId ref
+    // (prevents error_msg from being discarded when ASR fails — fixes "stuck in 理解中" race)
+    socket.emit('generation_start', {
+      sessionId: socket.id,
+      turnId: nextTurn,
+      generationId,
+    })
+
+    console.log(`[submit_audio] ${socket.id} gen=${generationId.slice(0,8)} bytes=${audioBytes} turn=${nextTurn} mode=${game.userMode}`)
+
+    // ====== Bug C Level 1: ASR circuit breaker check ======
+    // 如果 ASR circuit 已開，不打 provider，直接回 rate_limited error_msg
+    const asrBreakerStatus = ASRCircuitBreaker.check(socket.id)
+    if (asrBreakerStatus.mode === 'asr_rate_limited') {
+      const cooldownSec = Math.ceil((asrBreakerStatus.retryAfterMs || 0) / 1000)
+      console.warn(`[asr-circuit-breaker] submit_audio blocked: ${asrBreakerStatus.reason} cooldown=${cooldownSec}s`)
+      socket.emit('error_msg', {
+        sessionId: socket.id, turnId: nextTurn, generationId,
+        message: `語音辨識暫時忙碌，請等 ${cooldownSec} 秒後再試。`,
+        code: 'ASR_RATE_LIMITED',
+        asrCircuitOpen: true,
+        cooldownMs: asrBreakerStatus.retryAfterMs,
+      })
+      logUsage({
+        session_id: socket.id,
+        anon_user_id: game.anonUserId,
+        turn_id: nextTurn,
+        generation_id: generationId,
+        event_type: 'asr_circuit_open',
+        timestamp: new Date().toISOString(),
+        error_code: asrBreakerStatus.reason || 'ASR_RATE_LIMITED',
+        user_mode: game.userMode,
+        extra: {
+          asr_circuit_open: true,
+          asr_rate_limited: true,
+          cooldown_until: new Date(Date.now() + (asrBreakerStatus.retryAfterMs || 0)).toISOString(),
+          cooldown_ms: asrBreakerStatus.retryAfterMs,
+          not_charged: true,  // Bug C: ASR 429 不扣 quota
+        },
+      })
+      return  // terminal event = error_msg, frontend phase → idle
+    }
+
+    // ====== Structured event log (per 大G Bug C diagnostic) ======
+    const eventChain = {
+      sessionId: socket.id,
+      generationId,
+      turnCountBefore: game.turnCount,
+      nextTurn,
+      phase: 'submit_audio_start',
+      asrStarted: false,
+      asrDone: false,
+      asrError: null as any,
+      asrErrorCode: null as any,
+      asrRetryCount: 0,
+      asrCircuitOpen: false,
+      llmStarted: false,
+      textChunkEmitted: 0,
+      audioChunkEmitted: 0,
+      turnCompleteEmitted: false,
+      gameOverEmitted: false,
+      errorMsgEmitted: false,
+    }
 
     try {
       // 1. STT
       const t0 = Date.now()
+      eventChain.asrStarted = true
       socket.emit('status', { sessionId: socket.id, turnId: nextTurn, generationId, stage: 'transcribing' })
       const mimeType = payload.format || 'audio/webm'
-      const userText = await speechToText(payload.audio, mimeType)
+      const userText = await speechToText(payload.audio, mimeType, socket.id)
       const asrLatency = Date.now() - t0
+      eventChain.asrDone = true
       console.log(`[STT] ${socket.id} gen=${generationId.slice(0,8)} time=${asrLatency}ms text="${userText}"`)
 
       if (!userText || !userText.trim()) {
+        eventChain.errorMsgEmitted = true
         socket.emit('error_msg', {
           sessionId: socket.id, turnId: nextTurn, generationId,
-          message: '聽不清楚，請再說一次',
+          message: pickNarrativeError(),  // P0-1: narrative error copy
           code: 'ASR_EMPTY',
         })
         logUsage({
@@ -788,8 +1124,10 @@ io.on('connection', (socket) => {
           asr_latency_ms: asrLatency,
           audio_bytes_in: audioBytes,
           error_code: 'ASR_EMPTY',
+          user_mode: game.userMode,
+          extra: { not_charged: true, event_chain: eventChain },
         })
-        return
+        return  // terminal event = error_msg
       }
 
       // ====== P0-4: 檢查使用者輸入安全性 ======
@@ -809,17 +1147,19 @@ io.on('connection', (socket) => {
           event_type: 'safety_block_user',
           timestamp: new Date().toISOString(),
           error_code: userSafety.reason,
+          user_mode: game.userMode,
         })
 
         // 直接用 fallback 旁白當作 LLM 回應
         socket.emit('turn_start', { sessionId: socket.id, turnId: nextTurn, generationId, turn: nextTurn })
         const seq = 0
         socket.emit('text_chunk', { sessionId: socket.id, turnId: nextTurn, generationId, seq, text: fallbackText })
-        const audioBuffer = await textToSpeechWav(fallbackText)
-        if (audioBuffer.length > 0) {
+        // P0-fix: textToSpeechWav requires (text, sessionId); returns TTSResult with .buffer
+        const ttsResult = await textToSpeechWav(fallbackText, socket.id)
+        if (ttsResult.buffer.length > 0) {
           socket.emit('audio_chunk', {
             sessionId: socket.id, turnId: nextTurn, generationId, seq,
-            audio: audioBuffer.toString('base64'),
+            audio: ttsResult.buffer.toString('base64'),
             format: 'wav',
           })
         }
@@ -842,28 +1182,33 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
         asr_latency_ms: asrLatency,
         audio_bytes_in: audioBytes,
+        user_mode: game.userMode,
       })
 
       // 2. 加入對話歷史
       game.messages.push({ role: 'user', content: userText })
 
-      // 3. 提示 LLM 該收尾了
-      if (nextTurn >= MAX_TURNS - 1 && nextTurn < MAX_TURNS) {
+      // 3. 提示 LLM 該收尾了（hard-gated C: 漸進式收尾）
+      // turn 4/5 (nextTurn === MAX_TURNS - 1): 鋪陳收尾，但禁止 [[END]] / META:
+      // turn 5/5 (nextTurn >= MAX_TURNS): 必須結束，必須輸出 [[END]] + META:
+      if (nextTurn === MAX_TURNS - 1) {
         game.messages.push({
           role: 'assistant',
-          content: '（系統提示：這是最後一輪了，請給出一個明確的結局。結尾必須是 [[END]] 加上 META JSON，格式如：[[END]]\\nMETA:{"title":"劇名","endingType":"好結局/壞結局/懸念結局","verdict":"AI 判詞"}）',
+          content: '（系統提示：劇情接近尾聲，這一輪可以開始鋪陳收束、埋下最後的反轉或伏筆，把故事推向結局邊緣。但是——這一輪「不可以」結束故事。嚴格禁止：不要輸出 [[END]]、不要輸出 META:、不要給出結局。讓玩家進入下一輪才會迎來真正的結局。）',
         })
       } else if (nextTurn >= MAX_TURNS) {
         game.messages.push({
           role: 'assistant',
-          content: '（系統提示：已達到 5 輪上限，必須立即結束故事，給出結局。結尾必須是 [[END]] 加上 META JSON，格式如：[[END]]\\nMETA:{"title":"劇名","endingType":"好結局/壞結局/懸念結局","verdict":"AI 判詞"}）',
+          content: '（系統提示：這是最後一輪，必須立即結束故事。結尾必須是 [[END]] 加上 META JSON，格式如：[[END]]\\nMETA:{"title":"劇名","endingType":"好結局/壞結局/懸念結局","verdict":"AI 判詞"}。如果沒有輸出 [[END]]，系統會強制結束。）',
         })
       }
 
       socket.emit('turn_start', { sessionId: socket.id, turnId: nextTurn, generationId, turn: nextTurn })
 
       // 4. 串流 LLM + TTS
-      const allowEnding = nextTurn >= 4
+      // hard-gated C: 只在 turn 5/5 (nextTurn >= MAX_TURNS) 才允許真正 ending
+      // turn 4/5 即使 LLM 偷輸出 [[END]]/META:，也會被 suppress，遊戲繼續
+      const allowEnding = nextTurn >= MAX_TURNS
       let detectedEnding = false
       let endingMeta: EndingMeta | undefined
       const turnStart = Date.now()
@@ -871,29 +1216,70 @@ io.on('connection', (socket) => {
         socket,
         game.messages,
         (text, ending, meta) => {
-          const cleanText = allowEnding ? text : text.replace(/\[\[END\]\]/g, '').trim()
-          game.messages.push({ role: 'assistant', content: cleanText })
-          game.turnCount = nextTurn
-          if (allowEnding && ending) {
-            detectedEnding = true
-            game.ended = true
-            if (meta) endingMeta = meta
+          // hard-gated C: if not allowEnding (turn < 5/5), suppress ALL ending markers
+          // — strip [[END]] and META: from text, ignore ending signal, game continues
+          if (allowEnding) {
+            const cleanText = text.replace(/\[\[END\]\]/g, '').trim()
+            game.messages.push({ role: 'assistant', content: cleanText })
+            game.turnCount = nextTurn
+            if (ending) {
+              detectedEnding = true
+              game.ended = true
+              if (meta) endingMeta = meta
+            }
+          } else {
+            // turn 4/5 or earlier: LLM might have output [[END]]/META: despite instructions
+            // — strip them from text so they don't leak, but DON'T set game.ended
+            const suppressedText = text
+              .replace(/\[\[END\]\]/g, '')
+              .replace(/META:\s*\{[\s\S]*$/,'')
+              .replace(/META:\s*\{[^}]*\}/g, '')
+              .trim()
+            if (suppressedText) {
+              game.messages.push({ role: 'assistant', content: suppressedText })
+            } else {
+              // LLM 只輸出了 ending markers，没劇情文字 → push 原始 text（已經被 streamNarration 清過）
+              game.messages.push({ role: 'assistant', content: text.replace(/\[\[END\]\]/g, '').replace(/META:[\s\S]*$/,'').trim() })
+            }
+            game.turnCount = nextTurn
+            // detectedEnding stays false — game continues to next turn
+            if (ending) {
+              console.warn(`[ending-suppress] LLM output ending on turn ${nextTurn} (allowEnding=false), suppressed, game continues`)
+            }
           }
         },
         undefined,
         undefined,
         { sessionId: socket.id, turnId: nextTurn, generationId, anonUserId: game.anonUserId },
+        undefined,  // onFirstTextChunk (not used in submit_audio turn)
+        !allowEnding,  // hard-gated C: suppressEnding = true when allowEnding is false (turn < 5/5)
       )
 
+      // hard-gated C: finalEnding only true if allowEnding AND ending detected
       const finalEnding = allowEnding ? (isEnding || detectedEnding) : false
+
+      // P0-ending-fix: force ending on max turn even if LLM didn't output [[END]]
+      // This prevents games from running past turn 5 without an ending card
+      let forcedEndingMeta: EndingMeta | undefined
+      let wasForcedEnding = false
+      if (allowEnding && !finalEnding && nextTurn >= MAX_TURNS) {
+        console.warn(`[ending-force] max turn ${nextTurn} reached without ending, forcing fallback`)
+        wasForcedEnding = true
+        forcedEndingMeta = FALLBACK_ENDING_META
+        game.ended = true
+      }
+
+      const effectiveEnding = finalEnding || wasForcedEnding
+      const effectiveMeta = endingMeta || forcedEndingMeta
 
       socket.emit('turn_complete', {
         sessionId: socket.id,
         turnId: nextTurn,
         generationId,
         turn: game.turnCount,
-        isEnding: finalEnding,
+        isEnding: effectiveEnding,
       })
+      eventChain.turnCompleteEmitted = true
 
       logUsage({
         session_id: socket.id,
@@ -903,17 +1289,19 @@ io.on('connection', (socket) => {
         event_type: 'turn_complete',
         timestamp: new Date().toISOString(),
         completed: true,
-        ending_type: finalEnding ? endingMeta?.endingType : undefined,
-        extra: { turn_total_ms: Date.now() - turnStart, allow_ending: allowEnding },
+        ending_type: effectiveEnding ? effectiveMeta?.endingType : undefined,
+        extra: { turn_total_ms: Date.now() - turnStart, allow_ending: allowEnding, forced_ending: wasForcedEnding, event_chain: eventChain },
+        user_mode: game.userMode,
       })
 
-      if (finalEnding) {
+      if (effectiveEnding) {
+        eventChain.gameOverEmitted = true
         socket.emit('game_over', {
           sessionId: socket.id,
           turnId: nextTurn,
           generationId,
-          ending: 'auto',
-          meta: endingMeta,
+          ending: wasForcedEnding ? 'forced' : 'auto',
+          meta: effectiveMeta,
         })
         logUsage({
           session_id: socket.id,
@@ -923,18 +1311,32 @@ io.on('connection', (socket) => {
           event_type: 'game_over',
           timestamp: new Date().toISOString(),
           completed: true,
-          ending_type: endingMeta?.endingType,
-          extra: endingMeta ? { title: endingMeta.title, verdict: endingMeta.verdict } : {},
+          ending_type: effectiveMeta?.endingType,
+          extra: effectiveMeta ? { title: effectiveMeta.title, verdict: effectiveMeta.verdict, forced: wasForcedEnding } : {},
+          user_mode: game.userMode,
         })
       }
     } catch (err: any) {
       console.error('[submit_audio error]', err?.message || err)
-      // P0-6: fallback — 送一個 fallback 旁白而不是硬報錯
-      const fallbackMsg = '一陣雜訊干擾了你的訊號，畫面短暫失焦。請再說一次你想做什麼。'
+      // Bug C Level 1: 記錄 structured event chain
+      eventChain.asrError = String(err?.message || err).slice(0, 200)
+      eventChain.asrErrorCode = String(err?.code || err?.status || 'TURN_FAIL')
+      eventChain.asrRetryCount = (err as any)?.asrRetryCount || 0
+      const isAsrRateLimited = !!(err as any)?.asrRateLimited
+      eventChain.asrCircuitOpen = isAsrRateLimited
+      eventChain.errorMsgEmitted = true
+
+      // Bug C Level 1: ASR 429 用明確文案，不用模糊命運文案
+      const errMsg = isAsrRateLimited
+        ? '語音辨識暫時忙碌，請稍後再試。'
+        : pickNarrativeError()
+      const errCode = isAsrRateLimited ? 'ASR_RATE_LIMITED' : String(err?.code || err?.status || 'TURN_FAIL')
+
       socket.emit('error_msg', {
         sessionId: socket.id, turnId: nextTurn, generationId,
-        message: fallbackMsg,
-        code: String(err?.code || err?.status || 'TURN_FAIL'),
+        message: errMsg,
+        code: errCode,
+        asrCircuitOpen: isAsrRateLimited,
       })
       logUsage({
         session_id: socket.id,
@@ -943,8 +1345,17 @@ io.on('connection', (socket) => {
         generation_id: generationId,
         event_type: 'turn_error',
         timestamp: new Date().toISOString(),
-        error_code: String(err?.code || err?.status || 'TURN_FAIL'),
+        error_code: errCode,
         dropped: true,
+        user_mode: game.userMode,
+        // Bug C: ASR 429 不扣 quota
+        quota_refunded: isAsrRateLimited,
+        extra: {
+          not_charged: isAsrRateLimited,
+          asr_rate_limited: isAsrRateLimited,
+          asr_retry_count: eventChain.asrRetryCount,
+          event_chain: eventChain,
+        },
       })
     }
   })
@@ -961,6 +1372,7 @@ io.on('connection', (socket) => {
       event_type: 'share_clicked',
       timestamp: new Date().toISOString(),
       share_clicked: true,
+      user_mode: game.userMode,
     })
   })
 
@@ -975,6 +1387,7 @@ io.on('connection', (socket) => {
       event_type: 'replay_clicked',
       timestamp: new Date().toISOString(),
       replay_clicked: true,
+      user_mode: game.userMode,
     })
   })
 
@@ -982,6 +1395,9 @@ io.on('connection', (socket) => {
   socket.on('reset_game', () => {
     const oldGame = games.get(socket.id)
     const anonUserId = oldGame?.anonUserId || UsageLogger.hashUserId(socket.id)
+    // P0-3: preserve founderToken and userMode across reset
+    const founderToken = oldGame?.founderToken
+    const userMode = oldGame?.userMode || 'public' as UserMode
     games.set(socket.id, {
       messages: [{ role: 'assistant', content: SYSTEM_PROMPT }],
       turnCount: 0,
@@ -989,9 +1405,11 @@ io.on('connection', (socket) => {
       sessionId: socket.id,
       currentGenerationId: '',
       anonUserId,
+      founderToken,
+      userMode,
     })
     socket.emit('reset_ok', { sessionId: socket.id })
-    console.log(`[reset] ${socket.id}`)
+    console.log(`[reset] ${socket.id} mode=${userMode}`)
   })
 
   socket.on('disconnect', () => {

@@ -37,6 +37,10 @@ export interface UsageEvent {
   category?: string
   template_id?: string
   extra?: Record<string, any>
+  // P0-0: quota refund tracking
+  quota_refunded?: boolean
+  // P0-3: user mode classification (never log the token itself)
+  user_mode?: 'founder' | 'public'
 }
 
 export class UsageLogger {

@@ -1,8 +1,11 @@
-// 測試 OpenAI TTS 能不能在這個 sandbox 呼叫
+// 測試 OpenAI TTS 能不能在目前環境呼叫
 import OpenAI from 'openai'
 import fs from 'fs'
 
-const apiKey = process.env.OPENAI_API_KEY || 'sk-proj-TxUdy9oBKRvA4LBRi6vCdpCcM3j5lArAuLNRpqeTPgu7ot23TLwZ1CsqjCijniH-XCe2jmMh-6T3BlbkFJjbBc2i_9ovyeI41rfCIqgC2jtpTCFT73uKwsEqZoZ8CzXeYQbAd3Wk4jeCgfKiTqkUZs-ObYw'
+const apiKey = process.env.OPENAI_API_KEY
+if (!apiKey) {
+  throw new Error('OPENAI_API_KEY is required')
+}
 
 const client = new OpenAI({ apiKey })
 

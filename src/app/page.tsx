@@ -47,9 +47,10 @@ const CATEGORY_EMOJI: Record<string, string> = {
 
 // ============ Constants ============
 const AUDIO_PLAYBACK_RATE = 1.0
-const DAILY_FREE_LIMIT = 3
+const DAILY_FREE_LIMIT = 5  // P0-2: aligned with server PER_IP_DAILY_LIMIT (was 3)
 const STORAGE_KEY_DATE = 'lbb_date'
 const STORAGE_KEY_COUNT = 'lbb_count'
+const STORAGE_KEY_FOUNDER_TOKEN = 'lbb_founder_token'  // P0-3: founder token (never in URL after first load)
 
 // ============ Helpers: Daily limit ============
 function getDailyCount(): { date: string; count: number } {
@@ -75,6 +76,21 @@ function incrementDailyCount(): number {
   return newCount
 }
 
+// P0-3: Founder token — parse from URL (?founder=TOKEN), store in localStorage, clean URL
+function getFounderToken(): string | null {
+  if (typeof window === 'undefined') return null
+  const urlParams = new URLSearchParams(window.location.search)
+  const urlToken = urlParams.get('founder')
+  if (urlToken) {
+    localStorage.setItem(STORAGE_KEY_FOUNDER_TOKEN, urlToken)
+    // Clean URL — remove token to avoid leaking via sharing/referrer
+    const newUrl = window.location.pathname
+    window.history.replaceState({}, '', newUrl)
+    return urlToken
+  }
+  return localStorage.getItem(STORAGE_KEY_FOUNDER_TOKEN)
+}
+
 // ============ Component ============
 export default function VoiceGamePage() {
   // === State ===
@@ -95,6 +111,14 @@ export default function VoiceGamePage() {
   // P1: text-only fallback mode（TTS circuit breaker 觸發）
   const [ttsMode, setTtsMode] = useState<'voice' | 'text_only'>('voice')
   const [ttsModeReason, setTtsModeReason] = useState<string>('')
+  // P0-3: founder mode tracking
+  const [userMode, setUserMode] = useState<'founder' | 'public'>('public')
+  // Bug C Level 1: ASR circuit breaker cooldown tracking
+  const [asrCooldownUntil, setAsrCooldownUntil] = useState<number>(0)
+  const [asrCooldownSec, setAsrCooldownSec] = useState<number>(0)
+  // QA-anchored: track server commit hash + env for badge
+  const [serverCommitHash, setServerCommitHash] = useState<string>('')
+  const [serverEnv, setServerEnv] = useState<string>('')
 
   // ====== P0-1: generation tracking ======
   // currentGenerationId：前端只接受符合這個 ID 的 text/audio chunk，舊的全部 discard
@@ -122,6 +146,20 @@ export default function VoiceGamePage() {
   const streamRef = useRef<MediaStream | null>(null)
   // 用來中斷正在 await 的 audio 播放 promise
   const interruptResolverRef = useRef<(() => void) | null>(null)
+  // P0-postgame-fix: flag to discard late audio_chunk after game_over
+  // Set true on game_over, reset false on start_game / generation_start
+  const gameEndedRef = useRef<boolean>(false)
+  // Bug E fix: pending game_over — wait for audio to drain before showing ending card
+  const pendingGameOverRef = useRef<{
+    sessionId?: string
+    turnId?: number
+    generationId?: string
+    ending?: string
+    meta?: EndingMeta
+  } | null>(null)
+  const endingRevealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Bug E fix: ref to reveal function (avoids circular dependency with tryPlayNext)
+  const revealEndingRef = useRef<(() => void)>(() => {})
 
   // Helper: update both phase state and ref
   const setPhaseSafe = useCallback((p: Phase) => {
@@ -188,10 +226,14 @@ export default function VoiceGamePage() {
       }
     } finally {
       playLoopRunningRef.current = false
+      // Bug E fix: after audio loop ends, check if we should reveal pending ending
+      // This catches the case where last audio chunk finishes after game_over was received
+      revealEndingRef.current()
     }
   }, [muted])
 
   // 收到 audio_chunk — P0-1: 檢查 generationId，舊的 discard
+  // P0-postgame-fix: also discard if game has ended (late TTS promises still emitting)
   const handleAudioChunk = useCallback((payload: {
     sessionId?: string
     turnId?: number
@@ -200,6 +242,11 @@ export default function VoiceGamePage() {
     audio: string
     format: string
   }) => {
+    // P0-postgame-fix: game already ended, discard late audio
+    if (gameEndedRef.current) {
+      console.debug(`[discard audio] game ended, ignoring seq=${payload.seq}`)
+      return
+    }
     // 如果帶了 generationId 且不是當前 generation，直接 discard
     if (payload.generationId && payload.generationId !== currentGenerationIdRef.current) {
       console.debug(`[discard audio] gen ${payload.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
@@ -230,14 +277,65 @@ export default function VoiceGamePage() {
     }
   }, [])
 
+  // Bug E fix: check if audio has drained, then reveal ending card
+  const revealPendingGameOverWhenAudioDrained = useCallback(() => {
+    if (!pendingGameOverRef.current) return
+
+    const audioDrained =
+      audioQueueRef.current.size === 0 &&
+      isPlayingRef.current === false &&
+      playLoopRunningRef.current === false &&
+      currentlyPlayingSeqRef.current === null
+
+    if (!audioDrained) {
+      // Audio still playing or queued — check again in 200ms
+      if (endingRevealTimerRef.current) clearTimeout(endingRevealTimerRef.current)
+      endingRevealTimerRef.current = setTimeout(() => {
+        revealEndingRef.current()
+      }, 200)
+      return
+    }
+
+    // Audio drained — wait 400ms for natural pause, then reveal ending card
+    console.log('[ending-timing] audio drained, revealing ending card in 400ms')
+    if (endingRevealTimerRef.current) clearTimeout(endingRevealTimerRef.current)
+    endingRevealTimerRef.current = setTimeout(() => {
+      const pending = pendingGameOverRef.current
+      if (!pending) return
+
+      // NOW reveal ending card
+      gameEndedRef.current = true
+      interruptPlayback()  // clear any residual
+      if (pending.meta) setEndingMeta(pending.meta)
+      setPhaseSafe('ended')
+      pendingGameOverRef.current = null
+      endingRevealTimerRef.current = null
+      console.log(`[ending-timing] ending card revealed (ending=${pending.ending || 'auto'})`)
+    }, 400)
+  }, [interruptPlayback, setPhaseSafe])
+
+  // Bug E fix: keep ref updated so tryPlayNext can call it without circular dependency
+  revealEndingRef.current = revealPendingGameOverWhenAudioDrained
+
+  // Bug E fix: clear pending game over (called on reset / new game / generation_start)
+  const clearPendingGameOver = useCallback(() => {
+    pendingGameOverRef.current = null
+    if (endingRevealTimerRef.current) {
+      clearTimeout(endingRevealTimerRef.current)
+      endingRevealTimerRef.current = null
+    }
+  }, [])
+
   // ============ Socket ============
   useEffect(() => {
-    const socket = io('/?XTransformPort=3003', {
+    const voiceGameUrl = process.env.NEXT_PUBLIC_VOICE_GAME_URL || 'http://localhost:3003'
+    const socket = io(voiceGameUrl, {
       transports: ['websocket'],
       forceNew: true,
       reconnection: true,
       reconnectionAttempts: 5,
       timeout: 8000,
+      auth: { founderToken: getFounderToken() },  // P0-3: send founder token via socket auth
     })
     socketRef.current = socket
 
@@ -258,7 +356,7 @@ export default function VoiceGamePage() {
       setCategories(data.categories)
     })
 
-    // P0-1: 接收 connected 事件（含 quota 資訊）
+    // P0-1: 接收 connected 事件（含 quota 資訊 + userMode, P0-3）
     socket.on('connected', (data: {
       sessionId: string
       anonUserId?: string
@@ -268,7 +366,12 @@ export default function VoiceGamePage() {
         betaDisabled: boolean
         globalRemaining: number
         globalLimit: number
+        userMode?: 'founder' | 'public'
+        founderModeEnabled?: boolean
       }
+      userMode?: 'founder' | 'public'
+      commitHash?: string
+      env?: string
     }) => {
       if (data.quota) {
         setServerQuota({
@@ -277,6 +380,13 @@ export default function VoiceGamePage() {
           betaDisabled: data.quota.betaDisabled,
         })
       }
+      if (data.userMode) {
+        setUserMode(data.userMode)
+        console.log(`[connected] userMode=${data.userMode}`)
+      }
+      // QA-anchored: capture commit hash + env for badge
+      if (data.commitHash) setServerCommitHash(data.commitHash)
+      if (data.env) setServerEnv(data.env)
     })
 
     // P0-1: text_chunk 帶 generationId，舊的 discard
@@ -316,6 +426,29 @@ export default function VoiceGamePage() {
       if (typeof data.turnId === 'number') currentTurnIdRef.current = data.turnId
       setTurn(data.turn)
       setNarrationText('')
+    })
+
+    // P0-1: generation_start — server emits this BEFORE ASR, so we update our ref early
+    // (prevents error_msg from being discarded when ASR fails — fixes "stuck in 理解中" race)
+    // P0-fix-audio: also reset audio playback state here, to clear any stale audio from
+    // previous turn's background TTS that sneaked in between interruptPlayback (startRecording)
+    // and generation_start (server response). Without this, nextPlaySeqRef gets incremented
+    // by stale audio, causing turn N's audio to be out of sync → choppy playback from turn 3+.
+    socket.on('generation_start', (data: {
+      sessionId?: string
+      turnId?: number
+      generationId: string
+    }) => {
+      console.debug(`[generation_start] new gen=${data.generationId.slice(0,8)}, resetting audio state`)
+      // Reset audio playback state BEFORE updating generationId,
+      // so any in-flight audio_chunk from old generation is cleanly discarded
+      interruptPlayback()
+      // P0-postgame-fix: new generation means game is in progress, clear ended flag
+      gameEndedRef.current = false
+      // Bug E fix: clear any pending ending from previous turn
+      clearPendingGameOver()
+      currentGenerationIdRef.current = data.generationId
+      if (typeof data.turnId === 'number') currentTurnIdRef.current = data.turnId
     })
 
     socket.on('scene_template', (data: SceneTemplateInfo & { generationId?: string }) => {
@@ -372,25 +505,41 @@ export default function VoiceGamePage() {
         console.debug(`[discard game_over] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
         return
       }
-      if (data?.meta) {
-        setEndingMeta(data.meta)
-      }
-      setPhaseSafe('ended')
+      // Bug E fix: don't immediately show ending card — wait for audio to drain
+      // Store as pending, let revealPendingGameOverWhenAudioDrained handle timing
+      pendingGameOverRef.current = data
+      console.log(`[game_over] pending ending=${data.ending || 'auto'}, waiting for audio to drain`)
+      revealPendingGameOverWhenAudioDrained()
     })
 
     socket.on('status', (data: { stage: string; generationId?: string }) => {
-      if (data.generationId && data.generationId !== currentGenerationIdRef.current) return
+      // P0-1: always update generationId ref first (belt and suspenders, so error_msg is never orphaned)
+      if (data.generationId) {
+        currentGenerationIdRef.current = data.generationId
+      }
       if (data.stage === 'transcribing') {
         setPhaseSafe('transcribing')
       }
     })
 
-    socket.on('error_msg', (data: { message: string; code?: string; generationId?: string }) => {
-      // P0-fix2: 有 generationId 且不是 current 的 error 直接 discard
-      // 沒有 generationId 的 global error（如 quota_blocked、connect 失敗）才照收
+    socket.on('error_msg', (data: { message: string; code?: string; generationId?: string; asrCircuitOpen?: boolean; cooldownMs?: number }) => {
+      // P0-1: when in transcribing phase, accept error_msg even if generationId mismatches
+      // (prevents "stuck in 理解中" when ASR fails with new generationId that frontend hasn't seen)
       if (data.generationId && data.generationId !== currentGenerationIdRef.current) {
-        console.debug(`[discard error_msg] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
-        return
+        if (phaseRef.current !== 'transcribing') {
+          console.debug(`[discard error_msg] gen ${data.generationId.slice(0,8)} ≠ current ${currentGenerationIdRef.current.slice(0,8)}`)
+          return
+        }
+        // In transcribing: accept the error, update ref to match
+        console.debug(`[error_msg] accepting in transcribing, updating gen ${data.generationId.slice(0,8)}`)
+        currentGenerationIdRef.current = data.generationId
+      }
+      // Bug C Level 1: ASR circuit open → disable mic during cooldown
+      if (data.asrCircuitOpen && data.cooldownMs) {
+        const cooldownSec = Math.ceil(data.cooldownMs / 1000)
+        console.warn(`[asr-rate-limited] circuit open, cooldown ${cooldownSec}s`)
+        setAsrCooldownUntil(Date.now() + data.cooldownMs)
+        setAsrCooldownSec(cooldownSec)
       }
       setError(data.message)
       setPhaseSafe('idle')
@@ -409,6 +558,8 @@ export default function VoiceGamePage() {
       setPhaseSafe('idle')
       setError(null)
       interruptPlayback()
+      // Bug E fix: clear any pending ending
+      clearPendingGameOver()
     })
 
     return () => {
@@ -426,6 +577,23 @@ export default function VoiceGamePage() {
     }, 60000)
     return () => clearInterval(interval)
   }, [])
+
+  // P0-1: 30s safety timeout for transcribing phase (prevents permanent "理解中" stuck state)
+  useEffect(() => {
+    if (phase !== 'transcribing') return
+    const timer = setTimeout(() => {
+      if (phaseRef.current === 'transcribing') {
+        console.warn('[timeout] transcribing phase exceeded 30s, resetting to idle')
+        setError('命運線路短暫打結，請重新敲門。')
+        setPhaseSafe('idle')
+      }
+    }, 30000)
+    return () => clearTimeout(timer)
+  }, [phase, setPhaseSafe])
+
+  // Bug C Level 1: ASR cooldown countdown ticker
+  // (moved after asrInCooldown declaration to avoid TDZ error)
+  // Effect is defined later, after canRecord/asrInCooldown are declared
 
   // ============ Recording ============
   const startRecording = useCallback(async () => {
@@ -521,11 +689,14 @@ export default function VoiceGamePage() {
 
   // ============ Game Actions ============
   const startGame = useCallback((category?: string) => {
-    // 檢查 daily limit
-    const { count } = getDailyCount()
-    if (count >= DAILY_FREE_LIMIT) {
-      setError(`今日已玩 ${DAILY_FREE_LIMIT} 局免費額度，明天再來吧。`)
-      return
+    // P0-2/P0-3: founder mode skips local quota check (server is source of truth)
+    // P0-2: public mode uses serverQuota when available, falls back to local count
+    if (userMode !== 'founder') {
+      const remaining = serverQuota?.perIpRemaining ?? Math.max(0, DAILY_FREE_LIMIT - getDailyCount().count)
+      if (remaining <= 0) {
+        setError(`今日已玩 ${DAILY_FREE_LIMIT} 局免費額度，明天再來吧。`)
+        return
+      }
     }
     setError(null)
     setSubtitles([])
@@ -537,12 +708,16 @@ export default function VoiceGamePage() {
     setTurn(0)
     interruptPlayback()
     nextPlaySeqRef.current = 0
+    // P0-postgame-fix: new game starting, clear ended flag so audio plays normally
+    gameEndedRef.current = false
+    // Bug E fix: clear any pending ending
+    clearPendingGameOver()
     setPhaseSafe('narrating')
     // 開局時 increment
     const newCount = incrementDailyCount()
     setDailyCount(newCount)
     socketRef.current?.emit('start_game', category ? { category } : {})
-  }, [interruptPlayback, setPhaseSafe])
+  }, [interruptPlayback, setPhaseSafe, userMode, serverQuota, clearPendingGameOver])
 
   const resetGame = useCallback(() => {
     interruptPlayback()
@@ -550,8 +725,10 @@ export default function VoiceGamePage() {
     setSceneTemplate(null)
     setTtsMode('voice')
     setTtsModeReason('')
+    // Bug E fix: clear any pending ending
+    clearPendingGameOver()
     socketRef.current?.emit('reset_game')
-  }, [interruptPlayback])
+  }, [interruptPlayback, clearPendingGameOver])
 
   // ============ Share helpers ============
   const buildShareText = useCallback(() => {
@@ -623,8 +800,32 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
   }, [buildShareText, handleShareCopy, emitShareClicked])
 
   // ============ Render ============
-  const canRecord = connected && (phase === 'idle' || phase === 'narrating' || phase === 'transcribing') && phase !== 'ended'
-  const remainingToday = Math.max(0, DAILY_FREE_LIMIT - dailyCount)
+  // Bug C Level 1: disable mic during ASR circuit breaker cooldown
+  const asrInCooldown = asrCooldownUntil > Date.now()
+  const canRecord = connected && (phase === 'idle' || phase === 'narrating' || phase === 'transcribing') && !asrInCooldown
+
+  // Bug C Level 1: ASR cooldown countdown ticker (must be after asrInCooldown declaration)
+  useEffect(() => {
+    if (!asrInCooldown) {
+      setAsrCooldownSec(0)
+      return
+    }
+    const tick = () => {
+      const remaining = Math.max(0, Math.ceil((asrCooldownUntil - Date.now()) / 1000))
+      setAsrCooldownSec(remaining)
+      if (remaining <= 0) {
+        setAsrCooldownUntil(0)
+      }
+    }
+    tick()
+    const interval = setInterval(tick, 1000)
+    return () => clearInterval(interval)
+  }, [asrInCooldown, asrCooldownUntil])
+  // P0-2: server is source of truth for quota; fall back to local count for SSR/initial
+  const effectiveLimit = serverQuota?.perIpLimit || DAILY_FREE_LIMIT
+  const remainingToday = userMode === 'founder'
+    ? (serverQuota?.perIpRemaining ?? 100)
+    : (serverQuota?.perIpRemaining ?? Math.max(0, DAILY_FREE_LIMIT - dailyCount))
   const isOutOfCredits = remainingToday === 0 && phase === 'idle' && subtitles.length === 0
   const openingText = subtitles.find(s => s.role === 'narrator')?.text || ''
   const endingText = subtitles.filter(s => s.role === 'narrator').slice(-1)[0]?.text || ''
@@ -670,8 +871,21 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
           <span className="text-xs text-zinc-500 tracking-widest">
             TURN {turn} / 5
           </span>
+          {userMode === 'founder' && (
+            <span className="text-xs tracking-widest text-amber-300 bg-amber-950/40 border border-amber-800/50 px-2 py-0.5 rounded-full">
+              FOUNDER
+            </span>
+          )}
+          {serverCommitHash && (
+            <span
+              className="text-xs tracking-widest text-emerald-300 bg-emerald-950/40 border border-emerald-800/50 px-2 py-0.5 rounded-full"
+              title={`frontend: ${process.env.NEXT_PUBLIC_COMMIT_HASH?.slice(0,7) || '?'}\nvoice-game: ${serverCommitHash.slice(0,7)}\nprovider: openai\nenv: ${serverEnv || 'unknown'}`}
+            >
+              QA READY · {userMode} · OpenAI
+            </span>
+          )}
           <span className={`text-xs tracking-widest ${remainingToday === 0 ? 'text-red-400' : remainingToday === 1 ? 'text-amber-400' : 'text-zinc-500'}`}>
-            · {remainingToday}/{DAILY_FREE_LIMIT} LEFT
+            · {remainingToday}/{effectiveLimit} LEFT
           </span>
         </div>
       </header>
@@ -733,7 +947,7 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
                 )}
               </>
             )}
-            {remainingToday > 0 && remainingToday < DAILY_FREE_LIMIT && (
+            {userMode !== 'founder' && remainingToday > 0 && remainingToday < effectiveLimit && (
               <p className="text-xs text-zinc-600 tracking-widest">
                 今日剩餘 {remainingToday} 局免費
               </p>
@@ -1020,7 +1234,8 @@ https://preview-chat-ee6d98a4-ca67-4526-b626-44c9cb958846.space-z.ai/`
             )}
           </button>
           <p className="text-xs text-zinc-500 tracking-widest text-center">
-            {phase === 'recording' ? '鬆手送出' :
+            {asrInCooldown ? `語音辨識忙碌中 · ${asrCooldownSec}s 後可重試` :
+             phase === 'recording' ? '鬆手送出' :
              isPlaying ? 'AI 說話中 · 按住可搶話' :
              phase === 'transcribing' ? '理解中...' :
              phase === 'narrating' ? '旁白中 · 按住可搶話' :
