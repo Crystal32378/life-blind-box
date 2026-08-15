@@ -60,3 +60,9 @@ download/
 
 # ===== Skills directory (internal reference, not part of project) =====
 /skills/
+
+# ===== Secret-handling hardening (hygiene batch) =====
+# Catch ALL env-file variants (e.g. .env.development, .envrc); examples stay tracked.
+.env*
+!.env.example
+!.env.local.example

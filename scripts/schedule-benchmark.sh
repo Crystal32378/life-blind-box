@@ -25,6 +25,9 @@ git commit -m "chore(benchmark): auto-run after 4h cooldown
 $(cat $RESULT_FILE)" 2>&1 || echo "nothing to commit"
 
 # Push
-git push "https://Crystal32378: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@github.com/Crystal32378/life-blind-box.git" main 2>&1 | tail -3
+# Push — credentials must come from the environment (git credential helper,
+# `gh auth setup-git`, or SSH remotes). NEVER embed tokens in the remote URL:
+# they leak into shell history, process lists, and committed files.
+git push origin main 2>&1 | tail -3
 
 echo "[$(date)] Done."
