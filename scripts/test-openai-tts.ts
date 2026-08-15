@@ -2,7 +2,13 @@
 import OpenAI from 'openai'
 import fs from 'fs'
 
-const apiKey = process.env.OPENAI_API_KEY || 'sk-proj-TxUdy9oBKRvA4LBRi6vCdpCcM3j5lArAuLNRpqeTPgu7ot23TLwZ1CsqjCijniH-XCe2jmMh-6T3BlbkFJjbBc2i_9ovyeI41rfCIqgC2jtpTCFT73uKwsEqZoZ8CzXeYQbAd3Wk4jeCgfKiTqkUZs-ObYw'
+// API key must come from the environment — no hard-coded fallback.
+// (A fallback key is a live credential in git history.)
+const apiKey = process.env.OPENAI_API_KEY
+if (!apiKey) {
+  console.error('OPENAI_API_KEY is not set. Export it before running this script.')
+  process.exit(1)
+}
 
 const client = new OpenAI({ apiKey })
 
